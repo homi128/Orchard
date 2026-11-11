@@ -1,0 +1,79 @@
+# Orchard para iPhone. Genera el proyecto con:  xcodegen generate
+# Antes hay que correr scripts/build-engine.sh (bytecode del proveedor y extractor en Rust).
+name: Orchard
+options:
+  bundleIdPrefix: dev.orchard
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  Orchard:
+    type: application
+    platform: iOS
+    sources:
+      - path: Orchard
+      # Motor compartido con escritorio y Android: QuickJS + provider host.
+      - path: ../third_party/quickjs/quickjs.c
+        compilerFlags: ["-funsigned-char", "-w"]
+      - path: ../third_party/quickjs/dtoa.c
+        compilerFlags: ["-funsigned-char", "-w"]
+      - path: ../third_party/quickjs/libregexp.c
+        compilerFlags: ["-funsigned-char", "-w"]
+      - path: ../third_party/quickjs/libunicode.c
+        compilerFlags: ["-funsigned-char", "-w"]
+      - path: ../core/native/provider_host/provider_host.cpp
+      - path: ../core/native/provider_host/provider_host_media.cpp
+      # Bytecode del proveedor de YouTube (lo genera scripts/build-engine.sh).
+      - path: build/bundles/youtube-provider.qjc
+        buildPhase: resources
+      - path: build/bundles/youtube-po-minter.qjc
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.orchard.ios
+        PRODUCT_NAME: Orchard
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_OBJC_BRIDGING_HEADER: Orchard/Engine/Orchard-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/../third_party/quickjs"
+          - "$(SRCROOT)/../core/native"
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - "$(inherited)"
+          - "QUICKJS_NG_BUILD=1"
+        CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+        CLANG_ENABLE_OBJC_ARC: YES
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "$(SRCROOT)/build/rust/liborchard_youtube_extractor.a"
+        ENABLE_BITCODE: NO
+        DEAD_CODE_STRIPPING: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    info:
+      path: Orchard/Info.plist
+      properties:
+        CFBundleDisplayName: Orchard
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UIBackgroundModes: [audio]
+        UILaunchScreen: {}
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIStatusBarStyle: UIStatusBarStyleLightContent
+        ITSAppUsesNonExemptEncryption: false
+
+schemes:
+  Orchard:
+    build:
+      targets:
+        Orchard: all
+    run:
+      config: Debug
+    archive:
+      config: Release

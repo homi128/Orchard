@@ -1,0 +1,78 @@
+# Compila Orchard para iPhone en un Mac de GitHub y deja el .ipa (sin firmar)
+# como artefacto. Se instala firmándolo con tu Apple ID desde Sideloadly o AltStore.
+name: iOS
+
+on:
+  push:
+    paths:
+      - "ios/**"
+      - "providers/youtube/**"
+      - "core/native/provider_host/**"
+      - "crates/orchard-youtube-extractor/**"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Submódulo de QuickJS
+        run: git submodule update --init --depth 1 third_party/quickjs
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Herramientas
+        run: brew install xcodegen
+
+      - name: Motor (bytecode del proveedor y extractor en Rust)
+        run: bash ios/scripts/build-engine.sh
+
+      - name: Generar el proyecto de Xcode
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Compilar
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Orchard.xcodeproj \
+            -scheme Orchard \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build/xcodebuild.log | grep -E "error:|warning: .*(Swift|swift)|BUILD (SUCCEEDED|FAILED)" || true
+          test -d build/dd/Build/Products/Release-iphoneos/Orchard.app
+
+      - name: Armar el .ipa
+        working-directory: ios
+        run: |
+          rm -rf Payload Orchard.ipa
+          mkdir Payload
+          cp -R build/dd/Build/Products/Release-iphoneos/Orchard.app Payload/
+          zip -qry Orchard.ipa Payload
+          ls -la Orchard.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Orchard-iPhone
+          path: ios/Orchard.ipa
+          retention-days: 30
+
+      - name: Guardar el registro si falla
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ios/build/xcodebuild.log
+          if-no-files-found: ignore
