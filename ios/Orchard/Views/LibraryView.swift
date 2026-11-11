@@ -540,6 +540,9 @@ struct SettingsView: View {
                     Slider(value: $settings.crossfade, in: 0...12, step: 1)
                 }
                 Toggle("Autoplay al terminar la cola", isOn: $settings.autoplay)
+                NavigationLink(value: Route.equalizer) {
+                    LabeledContent("Ecualizador", value: settings.eqEnabled ? (settings.eqFull ? "Completo" : "Simple") : "Desactivado")
+                }
             } header: {
                 Text("Reproducción")
             } footer: {

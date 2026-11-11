@@ -74,6 +74,7 @@ struct NowPlayingView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var scrubbing: Double?
     @State private var drift = false
+    @State private var showEqualizer = false
     @State private var tab = 0
 
     var body: some View {
@@ -93,6 +94,10 @@ struct NowPlayingView: View {
             }
         }
         .background(background.ignoresSafeArea())
+        .sheet(isPresented: $showEqualizer) {
+            NavigationStack { EqualizerView(showsClose: true) }
+                .presentationDetents([.large])
+        }
     }
 
     /// El color de la carátula llena la pantalla y se mueve muy despacio.
@@ -221,11 +226,12 @@ struct NowPlayingView: View {
                 HStack {
                     sleepMenu
                     Spacer()
-                    if settings.crossfade > 0 {
-                        Label("Crossfade \(Int(settings.crossfade)) s", systemImage: "wave.3.right")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    Button { showEqualizer = true } label: {
+                        Image(systemName: "slider.vertical.3")
+                            .font(.callout)
+                            .foregroundStyle(settings.eqEnabled ? Theme.accent : .white.opacity(0.7))
                     }
+                    .accessibilityLabel("Ecualizador")
                     Spacer()
                     downloadButton(for: track)
                 }

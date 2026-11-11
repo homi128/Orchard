@@ -82,6 +82,10 @@ final class Player: ObservableObject {
     private var endObserver: NSObjectProtocol?
     private let settings = AppSettings.shared
 
+    /// Posición a la que volver tras recargar la canción (al activar el ecualizador).
+    private var resumeAt: Double?
+    private var resumePaused = false
+
     /// Canción cuyo final ya se procesó, para no avanzar dos veces.
     private var endedTrackId: String?
 
@@ -260,6 +264,17 @@ final class Player: ObservableObject {
         saveQueue()
     }
 
+    /// Recarga la canción actual en el mismo punto. El ecualizador se conecta al cargar
+    /// una canción, así que al activarlo hay que volver a cargarla.
+    func reloadKeepingPosition() {
+        guard current != nil, active.item != nil else { return }
+        let target = position
+        let paused = !isPlaying
+        loadCurrent()
+        resumeAt = target
+        resumePaused = paused
+    }
+
     // MARK: - Temporizador
 
     func sleep(after minutes: Int) {
@@ -314,6 +329,7 @@ final class Player: ObservableObject {
         position = 0
         duration = track.durationSeconds
         endedTrackId = nil
+        resumeAt = nil
         isPlaying = true
         updateNowPlaying()
         refreshLike()
@@ -332,6 +348,11 @@ final class Player: ObservableObject {
             if deck == nil { guard current?.id == track.id else { return } }
             let item = AVPlayerItem(asset: asset)
             item.preferredForwardBufferDuration = 30
+            if settings.eqEnabled {
+                await Equalizer.attach(to: item, asset: asset)
+                guard !Task.isCancelled else { return }
+                if deck == nil { guard current?.id == track.id else { return } }
+            }
             target.observers = []
             target.trackId = track.id
             target.item = item
@@ -424,6 +445,11 @@ final class Player: ObservableObject {
                             self.isLoading = false
                             let seconds = self.trueDuration(of: track, item: item)
                             if seconds > 0 { self.duration = seconds }
+                            if let target = self.resumeAt {
+                                self.resumeAt = nil
+                                self.seek(to: target)
+                                if self.resumePaused { self.pause() }
+                            }
                             self.updateNowPlaying()
                         }
                     case .failed:

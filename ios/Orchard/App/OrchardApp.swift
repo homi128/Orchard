@@ -32,6 +32,7 @@ enum Route: Hashable {
     case liked
     case downloads
     case settings
+    case equalizer
 }
 
 /// Estado de la interfaz que comparten varias pantallas.
@@ -125,6 +126,8 @@ extension View {
                 DownloadsView()
             case .settings:
                 SettingsView()
+            case .equalizer:
+                EqualizerView()
             }
         }
     }
