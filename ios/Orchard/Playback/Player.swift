@@ -8,8 +8,21 @@ struct ResolvedStream {
     let url: URL
     let headers: [String: String]
     let expiresAt: Date
+    let tracking: PlaybackTracking?
 }
 
+enum RepeatMode: String, CaseIterable {
+    case off, all, one
+    var icon: String {
+        switch self {
+        case .off, .all: return "repeat"
+        case .one: return "repeat.1"
+        }
+    }
+}
+
+/// Reproductor con dos AVPlayer: uno suena y el otro prepara la siguiente canción,
+/// para pasar de una a otra sin silencios o con crossfade.
 @MainActor
 final class Player: ObservableObject {
     static let shared = Player()
@@ -21,68 +34,114 @@ final class Player: ObservableObject {
     @Published private(set) var position: Double = 0
     @Published private(set) var duration: Double = 0
     @Published var errorMessage: String?
-    @Published var autoplay: Bool = UserDefaults.standard.object(forKey: "autoplay") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(autoplay, forKey: "autoplay") }
-    }
+    @Published private(set) var shuffle = false
+    @Published var repeatMode: RepeatMode = .off
+    @Published private(set) var sleepAt: Date?
+    @Published private(set) var sleepAtEndOfTrack = false
+    @Published private(set) var liked = false
 
     var current: Track? { queue.indices.contains(index) ? queue[index] : nil }
     var upcoming: [Track] { queue.indices.contains(index + 1) ? Array(queue[(index + 1)...]) : [] }
 
-    private let player = AVPlayer()
-    private var timeObserver: Any?
-    private var itemObservers: [NSKeyValueObservation] = []
-    private var endObserver: NSObjectProtocol?
+    private final class Deck {
+        let player = AVPlayer()
+        var trackId: String?
+        var item: AVPlayerItem?
+        var observers: [NSKeyValueObservation] = []
+        var ready = false
+        var failedOnce = false
+        init() {
+            player.automaticallyWaitsToMinimizeStalling = true
+            player.actionAtItemEnd = .pause
+        }
+        func clear() {
+            observers = []
+            player.pause()
+            player.replaceCurrentItem(with: nil)
+            item = nil
+            trackId = nil
+            ready = false
+            failedOnce = false
+            player.volume = 1
+        }
+    }
+
+    private var active = Deck()
+    private var standby = Deck()
     private var streams: [String: ResolvedStream] = [:]
     private var loadTask: Task<Void, Never>?
+    private var standbyTask: Task<Void, Never>?
+    private var ticker: Timer?
+    private var fading = false
+    private var fadeStart: Date?
     private var refilling = false
+    private var unshuffled: [Track] = []
     private var artwork: (id: String, image: MPMediaItemArtwork)?
+    private var endObserver: NSObjectProtocol?
+    private let settings = AppSettings.shared
+
+    // Historial de YouTube
+    private var historyCpn = ""
+    private var historyTrackId = ""
+    private var historyReported: Double = 0
 
     private static let userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
     private static let musicOrigin = "https://music.youtube.com"
 
     private init() {
-        player.automaticallyWaitsToMinimizeStalling = true
         configureAudioSession()
         configureRemoteCommands()
-        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
-                                                      queue: .main) { [weak self] time in
-            Task { @MainActor in
-                guard let self else { return }
-                self.position = time.seconds.isFinite ? time.seconds : 0
-                if let seconds = self.player.currentItem?.duration.seconds, seconds.isFinite, seconds > 0 {
-                    self.duration = seconds
-                }
-            }
-        }
         NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil,
                                                queue: .main) { [weak self] note in
             Task { @MainActor in self?.handleInterruption(note) }
         }
+        ticker = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+        restoreQueue()
     }
 
     // MARK: - Controles
 
-    func play(_ tracks: [Track], startAt start: Int = 0) {
+    func play(_ tracks: [Track], startAt start: Int = 0, shuffled: Bool = false) {
         guard tracks.indices.contains(start) else { return }
-        queue = tracks
-        index = start
-        load(current: true)
+        finishHistory()
+        if shuffled {
+            unshuffled = tracks
+            var rest = tracks
+            let first = rest.remove(at: start)
+            queue = [first] + rest.shuffled()
+            index = 0
+            shuffle = true
+        } else {
+            queue = tracks
+            index = start
+            if shuffle { shuffle = false; unshuffled = [] }
+        }
+        loadCurrent()
     }
 
     func playNext(_ track: Track) {
         if queue.isEmpty { play([track]); return }
         queue.insert(track, at: min(index + 1, queue.count))
+        resetStandby()
+        saveQueue()
     }
 
-    func addToQueue(_ track: Track) {
-        if queue.isEmpty { play([track]); return }
-        queue.append(track)
+    func addToQueue(_ tracks: [Track]) {
+        guard !tracks.isEmpty else { return }
+        if queue.isEmpty { play(tracks); return }
+        queue.append(contentsOf: tracks)
+        if upcoming.count == tracks.count { resetStandby() }
+        saveQueue()
     }
+
+    func addToQueue(_ track: Track) { addToQueue([track]) }
 
     func toggle() {
-        if player.currentItem == nil {
-            if current != nil { load(current: true) }
+        if active.item == nil {
+            if current != nil { loadCurrent() }
             return
         }
         if isPlaying { pause() } else { resume() }
@@ -90,23 +149,30 @@ final class Player: ObservableObject {
 
     func resume() {
         try? AVAudioSession.sharedInstance().setActive(true)
-        player.play()
+        active.player.play()
+        if fading { standby.player.play() }
         isPlaying = true
         updateNowPlaying()
     }
 
     func pause() {
-        player.pause()
+        active.player.pause()
+        if fading { finishFade() }
         isPlaying = false
         updateNowPlaying()
     }
 
     func next() {
+        guard current != nil else { return }
+        if fading { finishFade(); return }
         if queue.indices.contains(index + 1) {
-            index += 1
-            load(current: true)
+            advance(using: standby.trackId == queue[index + 1].id && standby.ready)
+        } else if repeatMode == .all, !queue.isEmpty {
+            finishHistory()
+            index = 0
+            loadCurrent()
         } else {
-            Task { await refillAndAdvance() }
+            Task { await refill(thenAdvance: true) }
         }
     }
 
@@ -115,13 +181,15 @@ final class Player: ObservableObject {
             seek(to: 0)
             return
         }
+        finishHistory()
         index -= 1
-        load(current: true)
+        loadCurrent()
     }
 
     func seek(to seconds: Double) {
+        if fading { finishFade() }
         let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
-        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+        active.player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             Task { @MainActor in self?.updateNowPlaying() }
         }
         position = max(0, seconds)
@@ -129,8 +197,37 @@ final class Player: ObservableObject {
 
     func jump(toQueueIndex newIndex: Int) {
         guard queue.indices.contains(newIndex) else { return }
+        finishHistory()
         index = newIndex
-        load(current: true)
+        loadCurrent()
+    }
+
+    func toggleShuffle() {
+        guard let now = current else { shuffle.toggle(); return }
+        if shuffle {
+            // Volver al orden original, manteniendo la canción actual.
+            let original = unshuffled.isEmpty ? queue : unshuffled
+            let added = queue.filter { track in !original.contains(where: { $0.id == track.id }) }
+            queue = original + added
+            index = queue.firstIndex(where: { $0.id == now.id }) ?? 0
+            unshuffled = []
+            shuffle = false
+        } else {
+            unshuffled = queue
+            let rest = upcoming.shuffled()
+            queue = Array(queue[...index]) + rest
+            shuffle = true
+        }
+        resetStandby()
+        saveQueue()
+    }
+
+    func cycleRepeat() {
+        switch repeatMode {
+        case .off: repeatMode = .all
+        case .all: repeatMode = .one
+        case .one: repeatMode = .off
+        }
     }
 
     /// Mueve canciones de "a continuación" (índices relativos a `upcoming`).
@@ -138,59 +235,132 @@ final class Player: ObservableObject {
         var rest = upcoming
         rest.move(fromOffsets: source, toOffset: destination)
         queue = Array(queue[...index]) + rest
+        resetStandby()
+        saveQueue()
     }
 
     func removeUpcoming(at offsets: IndexSet) {
         var rest = upcoming
         rest.remove(atOffsets: offsets)
         queue = Array(queue[...index]) + rest
+        resetStandby()
+        saveQueue()
     }
 
     func clearUpcoming() {
         guard !queue.isEmpty else { return }
         queue = Array(queue[...index])
+        resetStandby()
+        saveQueue()
     }
 
-    // MARK: - Carga del stream
+    // MARK: - Temporizador
 
-    private func load(current _: Bool) {
+    func sleep(after minutes: Int) {
+        sleepAtEndOfTrack = false
+        sleepAt = Date().addingTimeInterval(TimeInterval(minutes * 60))
+    }
+
+    func sleepAtEndOfCurrentTrack() {
+        sleepAt = nil
+        sleepAtEndOfTrack = true
+    }
+
+    func cancelSleep() {
+        sleepAt = nil
+        sleepAtEndOfTrack = false
+    }
+
+    // MARK: - Me gusta
+
+    func toggleLike() {
+        guard let track = current else { return }
+        let newValue = !liked
+        liked = newValue
+        Task {
+            do { try await Catalog.setLiked(track, newValue) } catch {
+                if current?.id == track.id { liked = !newValue }
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func refreshLike() {
+        guard let track = current else { liked = false; return }
+        liked = false
+        Task {
+            let value = await Catalog.isLiked(track)
+            if current?.id == track.id { liked = value }
+        }
+    }
+
+    // MARK: - Carga
+
+    private func loadCurrent() {
         guard let track = current else { return }
         loadTask?.cancel()
+        standbyTask?.cancel()
+        if fading { fading = false }
+        active.clear()
+        standby.clear()
         isLoading = true
         errorMessage = nil
         position = 0
         duration = track.durationSeconds
-        player.pause()
+        isPlaying = true
         updateNowPlaying()
+        refreshLike()
+        saveQueue()
         loadTask = Task { [weak self] in
-            await self?.start(track, refresh: false)
+            await self?.start(track, on: nil, refresh: false)
         }
     }
 
-    private func start(_ track: Track, refresh: Bool) async {
+    /// Carga `track` en un reproductor. `deck == nil` significa el activo, y empieza a sonar.
+    private func start(_ track: Track, on deck: Deck?, refresh: Bool) async {
+        let target = deck ?? active
         do {
-            let stream = try await resolve(track, refresh: refresh)
-            guard !Task.isCancelled, current?.id == track.id else { return }
-            let asset = AVURLAsset(url: stream.url, options: ["AVURLAssetHTTPHeaderFieldsKey": stream.headers])
+            let asset = try await asset(for: track, refresh: refresh)
+            guard !Task.isCancelled else { return }
+            if deck == nil { guard current?.id == track.id else { return } }
             let item = AVPlayerItem(asset: asset)
             item.preferredForwardBufferDuration = 30
-            observe(item, track: track, refreshed: refresh)
-            player.replaceCurrentItem(with: item)
-            try? AVAudioSession.sharedInstance().setActive(true)
-            player.play()
-            isPlaying = true
-            updateNowPlaying()
-            prefetchNext()
+            target.observers = []
+            target.trackId = track.id
+            target.item = item
+            target.ready = false
+            target.player.replaceCurrentItem(with: item)
+            observe(target, track: track)
+            if deck == nil {
+                try? AVAudioSession.sharedInstance().setActive(true)
+                target.player.volume = 1
+                target.player.play()
+                attachEndObserver()
+                updateNowPlaying()
+            } else {
+                target.player.volume = 0
+                target.player.pause()
+            }
         } catch {
-            guard !Task.isCancelled, current?.id == track.id else { return }
-            isLoading = false
-            isPlaying = false
-            errorMessage = error.localizedDescription
-            updateNowPlaying()
+            guard !Task.isCancelled else { return }
+            if deck == nil, current?.id == track.id {
+                isLoading = false
+                isPlaying = false
+                errorMessage = error.localizedDescription
+                updateNowPlaying()
+            }
         }
     }
 
-    private func resolve(_ track: Track, refresh: Bool) async throws -> ResolvedStream {
+    private func asset(for track: Track, refresh: Bool) async throws -> AVURLAsset {
+        if let file = DownloadStore.shared.fileURL(for: track.id) {
+            return AVURLAsset(url: file)
+        }
+        let stream = try await resolve(track, refresh: refresh)
+        return AVURLAsset(url: stream.url, options: ["AVURLAssetHTTPHeaderFieldsKey": stream.headers])
+    }
+
+    func resolve(_ track: Track, refresh: Bool = false) async throws -> ResolvedStream {
         if !refresh, let cached = streams[track.id], cached.expiresAt.timeIntervalSinceNow > 120 {
             return cached
         }
@@ -200,7 +370,7 @@ final class Player: ObservableObject {
         let payload: [String: Any] = [
             "session": session.providerJSON,
             "track": track.providerJSON,
-            "streamQuality": "high",
+            "streamQuality": settings.quality.rawValue,
             "refreshStream": refresh,
             // AVPlayer abre AAC en MP4 de forma nativa; Opus en WebM no.
             "audioMimeTypes": ["audio/mp4; codecs=\"mp4a.40.2\"", "audio/mp4; codecs=\"mp4a.40.5\""],
@@ -215,64 +385,265 @@ final class Player: ObservableObject {
         if let millis = json["expiresAt"] as? Double, millis > 0 {
             expires = Date(timeIntervalSince1970: millis > 1e12 ? millis / 1000 : millis)
         }
+        var tracking: PlaybackTracking?
+        if let info = json["playbackTracking"] as? [String: Any],
+           let playbackUrl = info["playbackUrl"] as? String, !playbackUrl.isEmpty,
+           let watchtimeUrl = info["watchtimeUrl"] as? String, !watchtimeUrl.isEmpty {
+            tracking = PlaybackTracking(playbackUrl: playbackUrl, watchtimeUrl: watchtimeUrl,
+                                        itag: info["itag"] as? Int ?? 140)
+        }
         let stream = ResolvedStream(url: url,
                                     headers: ["User-Agent": agent, "Origin": origin, "Referer": origin + "/"],
-                                    expiresAt: expires)
+                                    expiresAt: expires, tracking: tracking)
         streams[track.id] = stream
-        if streams.count > 12 { streams.removeValue(forKey: streams.keys.first!) }
+        if streams.count > 16, let oldest = streams.keys.first(where: { $0 != track.id }) {
+            streams.removeValue(forKey: oldest)
+        }
         return stream
     }
 
-    private func prefetchNext() {
-        guard let next = upcoming.first, streams[next.id] == nil else { return }
-        Task { [weak self] in _ = try? await self?.resolve(next, refresh: false) }
-    }
-
-    private func observe(_ item: AVPlayerItem, track: Track, refreshed: Bool) {
-        itemObservers = [
-            item.observe(\.status, options: [.new]) { [weak self] item, _ in
+    private func observe(_ deck: Deck, track: Track) {
+        guard let item = deck.item else { return }
+        deck.observers = [
+            item.observe(\.status, options: [.new]) { [weak self, weak deck] item, _ in
                 Task { @MainActor in
-                    guard let self, self.current?.id == track.id else { return }
+                    guard let self, let deck, deck.trackId == track.id else { return }
                     switch item.status {
                     case .readyToPlay:
-                        self.isLoading = false
-                        let seconds = item.duration.seconds
-                        if seconds.isFinite, seconds > 0 { self.duration = seconds }
-                        self.updateNowPlaying()
+                        deck.ready = true
+                        if deck === self.active {
+                            self.isLoading = false
+                            let seconds = item.duration.seconds
+                            if seconds.isFinite, seconds > 0 { self.duration = seconds }
+                            self.updateNowPlaying()
+                        }
                     case .failed:
-                        if !refreshed {
+                        if !deck.failedOnce {
                             // Una URL rechazada (403/410): pedir una nueva al proveedor, una vez.
+                            deck.failedOnce = true
                             self.streams[track.id] = nil
-                            self.loadTask = Task { [weak self] in await self?.start(track, refresh: true) }
-                        } else {
+                            if deck === self.active {
+                                self.loadTask = Task { [weak self] in await self?.start(track, on: nil, refresh: true) }
+                            } else {
+                                self.standbyTask = Task { [weak self, weak deck] in
+                                    guard let self, let deck else { return }
+                                    await self.start(track, on: deck, refresh: true)
+                                }
+                            }
+                        } else if deck === self.active {
                             self.isLoading = false
                             self.isPlaying = false
                             self.errorMessage = item.error?.localizedDescription ?? "No se pudo reproducir esta canción."
+                        } else {
+                            deck.clear()
                         }
                     default:
                         break
                     }
                 }
             },
-            item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] item, _ in
+            item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self, weak deck] item, _ in
                 Task { @MainActor in
-                    guard let self, self.current?.id == track.id else { return }
+                    guard let self, let deck, deck === self.active, deck.trackId == track.id else { return }
                     self.isLoading = item.isPlaybackBufferEmpty && self.isPlaying
                 }
             },
         ]
+    }
+
+    private func attachEndObserver() {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        guard let item = active.item else { return }
         endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item,
                                                              queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.next() }
+            Task { @MainActor in self?.trackEnded() }
         }
     }
 
-    /// Fin de la cola: si Autoplay está activo, sumar canciones parecidas y seguir.
-    private func refillAndAdvance() async {
-        guard autoplay, let last = queue.last, !refilling else {
+    private func trackEnded() {
+        if sleepAtEndOfTrack {
+            sleepAtEndOfTrack = false
             pause()
+            return
+        }
+        if repeatMode == .one {
             seek(to: 0)
+            active.player.play()
+            return
+        }
+        next()
+    }
+
+    /// Pasa a la siguiente canción, usando la que ya está preparada si se puede.
+    private func advance(using prepared: Bool) {
+        finishHistory()
+        index += 1
+        if prepared {
+            swapDecks()
+            active.player.volume = 1
+            active.player.play()
+            isLoading = !active.ready
+            duration = active.item?.duration.seconds.isFinite == true ? active.item!.duration.seconds : (current?.durationSeconds ?? 0)
+            position = 0
+            errorMessage = nil
+            attachEndObserver()
+            standby.clear()
+            refreshLike()
+            updateNowPlaying()
+            saveQueue()
+        } else {
+            loadCurrent()
+        }
+    }
+
+    private func swapDecks() {
+        let previous = active
+        active = standby
+        standby = previous
+    }
+
+    private func resetStandby() {
+        guard !fading else { return }
+        standbyTask?.cancel()
+        standby.clear()
+    }
+
+    /// Prepara la siguiente canción en el reproductor de reserva.
+    private func prepareStandby() {
+        guard !fading else { return }
+        let nextTrack: Track?
+        if repeatMode == .one {
+            nextTrack = nil
+        } else if queue.indices.contains(index + 1) {
+            nextTrack = queue[index + 1]
+        } else if repeatMode == .all {
+            nextTrack = queue.first
+        } else {
+            nextTrack = nil
+        }
+        guard let nextTrack, standby.trackId != nextTrack.id else { return }
+        standby.clear()
+        standby.trackId = nextTrack.id
+        standbyTask = Task { [weak self] in
+            guard let self else { return }
+            await self.start(nextTrack, on: self.standby, refresh: false)
+        }
+    }
+
+    // MARK: - Reloj interno: posición, crossfade, temporizador, historial
+
+    private func tick() {
+        let time = active.player.currentTime().seconds
+        if time.isFinite, active.item != nil { position = max(0, time) }
+        if let seconds = active.item?.duration.seconds, seconds.isFinite, seconds > 0 { duration = seconds }
+
+        if let sleepAt, Date() >= sleepAt {
+            self.sleepAt = nil
+            pause()
+        }
+
+        guard isPlaying, active.ready, duration > 0 else { return }
+        let remaining = duration - position
+
+        // Preparar la siguiente con tiempo, y pedir más canciones si la cola se acaba.
+        if remaining < max(45, settings.crossfade + 20) {
+            if upcoming.isEmpty, repeatMode == .off, settings.autoplay, !refilling {
+                Task { await refill(thenAdvance: false) }
+            }
+            prepareStandby()
+        }
+
+        let fade = settings.crossfade
+        if fade > 0, repeatMode != .one, !sleepAtEndOfTrack, !fading,
+           remaining <= fade, remaining > 0.3, standby.ready,
+           let nextId = standby.trackId,
+           nextId == (queue.indices.contains(index + 1) ? queue[index + 1].id : (repeatMode == .all ? queue.first?.id : nil)) {
+            beginFade()
+        }
+        if fading { stepFade() }
+
+        reportHistory()
+    }
+
+    private func beginFade() {
+        fading = true
+        fadeStart = Date()
+        standby.player.volume = 0
+        standby.player.play()
+    }
+
+    private func stepFade() {
+        guard let fadeStart else { return }
+        let total = max(settings.crossfade, 0.5)
+        let progress = min(1, Date().timeIntervalSince(fadeStart) / total)
+        // Curva de igual potencia: el volumen total no se hunde a la mitad del cruce.
+        active.player.volume = Float(cos(progress * .pi / 2))
+        standby.player.volume = Float(sin(progress * .pi / 2))
+        if progress >= 1 || active.player.timeControlStatus == .paused { finishFade() }
+    }
+
+    private func finishFade() {
+        guard fading else { return }
+        fading = false
+        fadeStart = nil
+        let wrapping = !queue.indices.contains(index + 1)
+        finishHistory()
+        if wrapping { index = -1 }
+        active.player.pause()
+        index += 1
+        swapDecks()
+        active.player.volume = 1
+        if !isPlaying { active.player.pause() }
+        standby.clear()
+        attachEndObserver()
+        isLoading = !active.ready
+        errorMessage = nil
+        refreshLike()
+        updateNowPlaying()
+        saveQueue()
+    }
+
+    private func reportHistory() {
+        guard settings.sendHistory, let track = current, SessionStore.shared.isSignedIn,
+              DownloadStore.shared.fileURL(for: track.id) == nil,
+              let tracking = streams[track.id]?.tracking else { return }
+        if historyTrackId != track.id {
+            finishHistory()
+            historyTrackId = track.id
+            historyCpn = Self.makeCpn()
+            historyReported = position
+            let cpn = historyCpn, at = position
+            Task { await Catalog.history("history.start", tracking: tracking, cpn: cpn, watchTime: at, final: false) }
+            return
+        }
+        if position >= historyReported + 30 || position < historyReported {
+            historyReported = position
+            let cpn = historyCpn, at = position
+            Task { await Catalog.history("history.update", tracking: tracking, cpn: cpn, watchTime: at, final: false) }
+        }
+    }
+
+    private func finishHistory() {
+        guard !historyCpn.isEmpty, let tracking = streams[historyTrackId]?.tracking else {
+            historyCpn = ""
+            historyTrackId = ""
+            return
+        }
+        let cpn = historyCpn, at = position
+        historyCpn = ""
+        historyTrackId = ""
+        Task { await Catalog.history("history.update", tracking: tracking, cpn: cpn, watchTime: at, final: true) }
+    }
+
+    private static func makeCpn() -> String {
+        let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+        return String((0..<16).map { _ in alphabet.randomElement()! })
+    }
+
+    /// Fin de la cola: si Autoplay está activo, sumar canciones parecidas.
+    private func refill(thenAdvance: Bool) async {
+        guard settings.autoplay, let last = queue.last, !refilling else {
+            if thenAdvance { pause(); seek(to: 0) }
             return
         }
         refilling = true
@@ -280,21 +651,52 @@ final class Player: ObservableObject {
         do {
             let known = Set(queue.map(\.id))
             let more = try await Catalog.upNext(after: last).filter { !known.contains($0.id) }
-            guard !more.isEmpty else { pause(); return }
+            guard !more.isEmpty else { if thenAdvance { pause() }; return }
             queue.append(contentsOf: more.prefix(25))
-            index += 1
-            load(current: true)
+            saveQueue()
+            if thenAdvance { advance(using: false) }
         } catch {
-            pause()
-            errorMessage = error.localizedDescription
+            if thenAdvance {
+                pause()
+                errorMessage = error.localizedDescription
+            }
         }
+    }
+
+    // MARK: - Guardar la cola entre aperturas
+
+    private var queueURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("queue.json")
+    }
+
+    private struct SavedQueue: Codable {
+        let tracks: [Track]
+        let index: Int
+    }
+
+    private func saveQueue() {
+        let saved = SavedQueue(tracks: Array(queue.prefix(300)), index: min(index, max(0, min(queue.count, 300) - 1)))
+        let url = queueURL
+        Task.detached {
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let data = try? JSONEncoder().encode(saved) { try? data.write(to: url, options: .atomic) }
+        }
+    }
+
+    private func restoreQueue() {
+        guard let data = try? Data(contentsOf: queueURL),
+              let saved = try? JSONDecoder().decode(SavedQueue.self, from: data),
+              saved.tracks.indices.contains(saved.index) else { return }
+        queue = saved.tracks
+        index = saved.index
+        duration = current?.durationSeconds ?? 0
     }
 
     // MARK: - Sistema: sesión de audio, pantalla de bloqueo
 
     private func configureAudioSession() {
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .default, policy: .longFormAudio)
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, policy: .longFormAudio)
     }
 
     private func handleInterruption(_ note: Notification) {
@@ -302,6 +704,7 @@ final class Player: ObservableObject {
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
         if type == .began {
             isPlaying = false
+            if fading { finishFade() }
             updateNowPlaying()
         } else if let options = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt,
                   AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume) {
@@ -333,9 +736,11 @@ final class Player: ObservableObject {
         }
         center.changePlaybackPositionCommand.addTarget { [weak self] event in
             guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
-            Task { @MainActor in self?.seek(to: event.positionTime) }
+            let time = event.positionTime
+            Task { @MainActor in self?.seek(to: time) }
             return .success
         }
+        center.likeCommand.isEnabled = false
     }
 
     private func updateNowPlaying() {
