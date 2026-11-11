@@ -35,6 +35,7 @@ struct Artwork: View {
 
 struct TrackRow: View {
     @EnvironmentObject private var downloads: DownloadStore
+    @EnvironmentObject private var player: Player
     let track: Track
     var isCurrent = false
     var number: Int? = nil
@@ -47,11 +48,17 @@ struct TrackRow: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 24)
             } else {
-                Artwork(url: track.thumbnail, fallback: track.fallbackThumbnail, size: 48, corner: 6)
+                Artwork(url: track.thumbnail, fallback: track.fallbackThumbnail, size: 50, corner: 8)
+                    .overlay {
+                        if isCurrent {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.black.opacity(0.55))
+                            EqualizerBars(animating: player.isPlaying, color: Theme.accent)
+                        }
+                    }
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(track.title)
-                    .font(.body.weight(isCurrent ? .semibold : .regular))
+                    .font(.body.weight(isCurrent ? .semibold : .medium))
                     .foregroundStyle(isCurrent ? Theme.accent : .primary)
                     .lineLimit(1)
                 HStack(spacing: 4) {
@@ -167,9 +174,10 @@ struct ItemCard: View {
     var body: some View {
         VStack(alignment: item.kind == .artist ? .center : .leading, spacing: 6) {
             Artwork(url: item.thumbnail, fallback: item.track?.fallbackThumbnail, size: size,
-                    corner: item.kind == .artist ? size / 2 : 10)
+                    corner: item.kind == .artist ? size / 2 : 14)
+                .shadow(color: .black.opacity(0.35), radius: 10, y: 6)
             Text(item.title)
-                .font(.subheadline.weight(.medium))
+                .font(.subheadline.weight(.semibold))
                 .lineLimit(2)
                 .multilineTextAlignment(item.kind == .artist ? .center : .leading)
             if !item.subtitle.isEmpty {
@@ -189,7 +197,7 @@ struct ShelfView: View {
         VStack(alignment: .leading, spacing: 12) {
             if !shelf.title.isEmpty {
                 Text(shelf.title)
-                    .font(.title3.weight(.bold))
+                    .font(Theme.display(22, weight: .bold))
                     .padding(.horizontal)
             }
             ScrollView(.horizontal, showsIndicators: false) {
@@ -221,11 +229,11 @@ struct ItemLink<Label: View>: View {
                     player.play([track])
                 }
             } label: { label() }
-            .buttonStyle(.plain)
+            .buttonStyle(PressableStyle())
             .contextMenu { TrackMenuItems(track: track) }
         } else if item.browseId != nil {
             NavigationLink(value: Route.item(item)) { label() }
-                .buttonStyle(.plain)
+                .buttonStyle(PressableStyle())
         } else {
             label().opacity(0.6)
         }
@@ -285,10 +293,11 @@ struct SearchLauncher: View {
             }
             .foregroundStyle(.secondary)
             .padding(.horizontal, 14)
-            .padding(.vertical, 11)
-            .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .padding(.vertical, 13)
+            .background(Theme.surface, in: Capsule())
+            .overlay(Capsule().strokeBorder(Theme.hairline))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.98))
         .accessibilityLabel("Buscar")
     }
 }

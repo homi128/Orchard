@@ -2,12 +2,15 @@ import SwiftUI
 
 struct MiniPlayerBar: View {
     @EnvironmentObject private var player: Player
+    @EnvironmentObject private var tint: ArtworkTint
     @Binding var showNowPlaying: Bool
 
     var body: some View {
         if let track = player.current {
             HStack(spacing: 12) {
-                Artwork(url: track.thumbnail, fallback: track.fallbackThumbnail, size: 44, corner: 6)
+                Artwork(url: track.thumbnail, fallback: track.fallbackThumbnail, size: 44, corner: 9)
+                    .id(track.id)
+                    .transition(.scale(scale: 0.8).combined(with: .opacity))
                 VStack(alignment: .leading, spacing: 1) {
                     Text(track.title).font(.subheadline.weight(.semibold)).lineLimit(1)
                     Text(player.errorMessage ?? track.artist)
@@ -34,15 +37,23 @@ struct MiniPlayerBar: View {
             .foregroundStyle(.primary)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(tint.color.opacity(0.38)))
+                    .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Color.white.opacity(0.1)))
+                    .shadow(color: .black.opacity(0.35), radius: 12, y: 6)
+            }
+            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: track.id)
             .overlay(alignment: .bottom) {
                 GeometryReader { geometry in
                     let progress = player.duration > 0 ? min(1, player.position / player.duration) : 0
-                    Capsule().fill(Theme.accent)
+                    Capsule().fill(Color.white.opacity(0.9))
                         .frame(width: geometry.size.width * progress, height: 2)
+                        .animation(.linear(duration: 0.25), value: progress)
                 }
                 .frame(height: 2)
-                .padding(.horizontal, 14)
+                .padding(.horizontal, 18)
             }
             .padding(.horizontal, 8)
             .padding(.bottom, 4)
@@ -58,8 +69,11 @@ struct NowPlayingView: View {
     @EnvironmentObject private var downloads: DownloadStore
     @EnvironmentObject private var sessions: SessionStore
     @EnvironmentObject private var ui: AppUI
+    @EnvironmentObject private var tint: ArtworkTint
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var scrubbing: Double?
+    @State private var drift = false
     @State private var tab = 0
 
     var body: some View {
@@ -81,15 +95,28 @@ struct NowPlayingView: View {
         .background(background.ignoresSafeArea())
     }
 
+    /// El color de la carátula llena la pantalla y se mueve muy despacio.
     private var background: some View {
         ZStack {
-            Color.black
-            if let track = player.current {
-                Artwork(url: track.largeThumbnail, fallback: track.fallbackThumbnail, corner: 0)
-                    .blur(radius: 60)
-                    .opacity(0.45)
-                    .scaleEffect(1.4)
-            }
+            Theme.base
+            LinearGradient(colors: [tint.color, tint.color.opacity(0.35), Theme.base],
+                           startPoint: .top, endPoint: .bottom)
+            Circle()
+                .fill(tint.color)
+                .frame(width: 420, height: 420)
+                .blur(radius: 120)
+                .opacity(0.55)
+                .offset(x: drift ? 110 : -110, y: drift ? -220 : -120)
+            Circle()
+                .fill(Theme.peach)
+                .frame(width: 260, height: 260)
+                .blur(radius: 130)
+                .opacity(0.16)
+                .offset(x: drift ? -120 : 100, y: drift ? 260 : 180)
+        }
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.easeInOut(duration: 9).repeatForever(autoreverses: true)) { drift = true }
         }
     }
 
@@ -99,24 +126,29 @@ struct NowPlayingView: View {
         VStack(spacing: 20) {
             Spacer(minLength: 0)
             if let track = player.current {
-                Artwork(url: track.largeThumbnail, fallback: track.fallbackThumbnail, corner: 14)
-                    .frame(maxWidth: 340)
-                    .shadow(radius: 24, y: 12)
-                    .padding(.horizontal, 28)
-                    .scaleEffect(player.isPlaying ? 1 : 0.92)
-                    .animation(.spring(response: 0.4, dampingFraction: 0.8), value: player.isPlaying)
+                Artwork(url: track.largeThumbnail, fallback: track.fallbackThumbnail, corner: 22)
+                    .frame(maxWidth: 350)
+                    .shadow(color: .black.opacity(0.45), radius: 30, y: 18)
+                    .padding(.horizontal, 26)
+                    .scaleEffect(player.isPlaying ? 1 : 0.86)
+                    .animation(.spring(response: 0.45, dampingFraction: 0.7), value: player.isPlaying)
+                    .id(track.id)
+                    .transition(.asymmetric(insertion: .scale(scale: 0.9).combined(with: .opacity),
+                                            removal: .opacity))
 
                 HStack(alignment: .center, spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(track.title).font(.title2.weight(.bold)).lineLimit(2)
-                        Text(track.artist).font(.body).foregroundStyle(.secondary).lineLimit(1)
+                        Text(track.title).font(Theme.display(24, weight: .bold)).lineLimit(2)
+                        Text(track.artist).font(.body).foregroundStyle(.white.opacity(0.7)).lineLimit(1)
                     }
                     Spacer(minLength: 0)
                     if sessions.isSignedIn {
                         Button { player.toggleLike() } label: {
                             Image(systemName: player.liked ? "heart.fill" : "heart")
                                 .font(.title2)
-                                .foregroundStyle(player.liked ? Theme.accent : .white)
+                                .foregroundStyle(player.liked ? Theme.peach : .white)
+                                .scaleEffect(player.liked ? 1.15 : 1)
+                                .animation(.spring(response: 0.3, dampingFraction: 0.45), value: player.liked)
                         }
                         .accessibilityLabel(player.liked ? "Quitar me gusta" : "Me gusta")
                     }
@@ -133,25 +165,18 @@ struct NowPlayingView: View {
                     Text(message).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center).padding(.horizontal)
                 }
 
-                VStack(spacing: 4) {
-                    Slider(value: Binding(
-                        get: { scrubbing ?? player.position },
-                        set: { scrubbing = $0 }
-                    ), in: 0...max(player.duration, 1)) { editing in
-                        if !editing, let value = scrubbing {
-                            player.seek(to: value)
-                            scrubbing = nil
-                        }
-                    }
+                VStack(spacing: 2) {
+                    Scrubber(position: player.position, duration: player.duration,
+                             onSeek: { player.seek(to: $0) }, scrubbing: $scrubbing)
                     HStack {
                         Text(formatTime(scrubbing ?? player.position))
                         Spacer()
                         Text("-" + formatTime(max(0, player.duration - (scrubbing ?? player.position))))
                     }
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.white.opacity(0.65))
                 }
-                .padding(.horizontal, 24)
+                .padding(.horizontal, 26)
 
                 HStack {
                     Button { player.toggleShuffle() } label: {
@@ -161,11 +186,13 @@ struct NowPlayingView: View {
                     .accessibilityLabel(player.shuffle ? "Desactivar aleatorio" : "Aleatorio")
                     Spacer()
                     Button { player.previous() } label: { Image(systemName: "backward.fill").font(.title) }
+                        .buttonStyle(PressableStyle(scale: 0.85))
                         .accessibilityLabel("Anterior")
                     Spacer()
                     Button { player.toggle() } label: {
                         ZStack {
-                            Circle().fill(Color.white).frame(width: 72, height: 72)
+                            Circle().fill(Color.white).frame(width: 76, height: 76)
+                                .shadow(color: .black.opacity(0.3), radius: 12, y: 6)
                             if player.isLoading {
                                 ProgressView().tint(.black)
                             } else {
@@ -175,9 +202,11 @@ struct NowPlayingView: View {
                             }
                         }
                     }
+                    .buttonStyle(PressableStyle(scale: 0.9))
                     .accessibilityLabel(player.isPlaying ? "Pausar" : "Reproducir")
                     Spacer()
                     Button { player.next() } label: { Image(systemName: "forward.fill").font(.title) }
+                        .buttonStyle(PressableStyle(scale: 0.85))
                         .accessibilityLabel("Siguiente")
                     Spacer()
                     Button { player.cycleRepeat() } label: {
@@ -207,6 +236,7 @@ struct NowPlayingView: View {
             Spacer(minLength: 0)
         }
         .padding(.bottom, 20)
+        .animation(.spring(response: 0.45, dampingFraction: 0.8), value: player.current?.id)
     }
 
     private var sleepMenu: some View {
@@ -305,8 +335,11 @@ struct LyricsPanel: View {
                         VStack(alignment: .leading, spacing: 18) {
                             ForEach(result.lines) { line in
                                 Text(line.text.isEmpty ? "♪" : line.text)
-                                    .font(.title2.weight(.bold))
+                                    .font(Theme.display(26, weight: .bold))
                                     .foregroundStyle(color(for: line, synced: result.synced))
+                                    .scaleEffect(result.synced && line.id == activeLine ? 1 : 0.94, anchor: .leading)
+                                    .blur(radius: result.synced && line.id != activeLine ? 0.6 : 0)
+                                    .animation(.spring(response: 0.4, dampingFraction: 0.8), value: activeLine)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .id(line.id)
                                     .onTapGesture {

@@ -7,6 +7,7 @@ struct OrchardApp: App {
     @StateObject private var settings = AppSettings.shared
     @StateObject private var downloads = DownloadStore.shared
     @StateObject private var ui = AppUI()
+    @StateObject private var tint = ArtworkTint.shared
 
     var body: some Scene {
         WindowGroup {
@@ -16,14 +17,11 @@ struct OrchardApp: App {
                 .environmentObject(settings)
                 .environmentObject(downloads)
                 .environmentObject(ui)
+                .environmentObject(tint)
                 .tint(Theme.accent)
                 .preferredColorScheme(.dark)
         }
     }
-}
-
-enum Theme {
-    static let accent = Color(red: 0.71, green: 0.63, blue: 1.0)
 }
 
 enum Tab: Hashable { case home, search, library }
@@ -94,6 +92,7 @@ struct RootView: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
                     .background(.ultraThinMaterial, in: Capsule())
+                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.12)))
                     .padding(.top, 8)
                     .transition(.move(edge: .top).combined(with: .opacity))
                     .onTapGesture { ui.toast = nil; downloads.lastError = nil }
@@ -104,6 +103,7 @@ struct RootView: View {
             }
         }
         .animation(.easeOut(duration: 0.2), value: ui.toast)
+        .task(id: player.current?.id) { ArtworkTint.shared.update(for: player.current) }
     }
 }
 

@@ -73,10 +73,22 @@ enum Catalog {
 
     // MARK: Búsqueda
 
-    static func search(_ query: String, filter: SearchFilter) async throws -> SearchResults {
+    /// `quiet` busca como invitado: lo que escribes letra por letra no queda en tu historial de YouTube.
+    static func search(_ query: String, filter: SearchFilter, quiet: Bool = false) async throws -> SearchResults {
         var request = payload(["query": query, "filter": filter.rawValue])
-        if SessionStore.shared.session == nil { request["guest"] = true }
-        let result = try await Provider.object("catalog.search", request)
+        var result: [String: Any] = [:]
+        if quiet || SessionStore.shared.session == nil {
+            request["guest"] = true
+            do {
+                result = try await Provider.object("catalog.search", request)
+            } catch {
+                guard SessionStore.shared.session != nil else { throw error }
+                request["guest"] = nil
+                result = try await Provider.object("catalog.search", request)
+            }
+        } else {
+            result = try await Provider.object("catalog.search", request)
+        }
         var results = SearchResults()
         for section in result["sections"] as? [[String: Any]] ?? [] {
             let key = (section["key"] as? String ?? "").lowercased()

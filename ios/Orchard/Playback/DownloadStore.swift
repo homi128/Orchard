@@ -110,6 +110,8 @@ final class DownloadStore: ObservableObject {
             }
             var saved = track
             saved.thumbnail = track.largeThumbnail ?? track.thumbnail
+            // Guardar la duración real: sin conexión no hay a quién preguntarle.
+            if stream.duration > 0 { saved.durationSeconds = stream.duration }
             entries.removeAll { $0.id == track.id }
             entries.insert(Entry(track: saved, file: file, bytes: bytes, date: Date()), at: 0)
             save()

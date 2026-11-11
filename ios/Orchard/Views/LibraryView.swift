@@ -42,6 +42,8 @@ struct LibraryView: View {
             }
         }
         .navigationTitle("Biblioteca")
+        .scrollContentBackground(.hidden)
+        .background(Theme.base.ignoresSafeArea())
         .refreshable { await load() }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
@@ -179,6 +181,8 @@ struct CollectionView: View {
             }
         }
         .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(Theme.base.ignoresSafeArea())
         .overlay { if loading && tracks.isEmpty { ProgressView() } }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
@@ -214,7 +218,8 @@ struct CollectionView: View {
     private var header: some View {
         VStack(spacing: 14) {
             if let item {
-                Artwork(url: page?.thumbnail ?? item.thumbnail, size: 200, corner: 12)
+                Artwork(url: page?.thumbnail ?? item.thumbnail, size: 220, corner: 18)
+                    .shadow(color: .black.opacity(0.5), radius: 24, y: 14)
             } else {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(LinearGradient(colors: [Theme.accent, .indigo], startPoint: .topLeading, endPoint: .bottomTrailing))
@@ -222,7 +227,7 @@ struct CollectionView: View {
                     .overlay(Image(systemName: "heart.fill").font(.system(size: 64)).foregroundStyle(.white))
             }
             Text(title)
-                .font(.title2.weight(.bold))
+                .font(Theme.display(26))
                 .multilineTextAlignment(.center)
             let subtitle = page?.subtitle ?? item?.subtitle ?? ""
             if !subtitle.isEmpty {
@@ -233,14 +238,26 @@ struct CollectionView: View {
                     player.play(tracks)
                 } label: { Label("Reproducir", systemImage: "play.fill").frame(maxWidth: .infinity) }
                     .buttonStyle(.borderedProminent)
+                    .foregroundStyle(.black)
                 Button {
                     player.play(tracks, startAt: Int.random(in: 0..<max(tracks.count, 1)), shuffled: true)
                 } label: { Label("Aleatorio", systemImage: "shuffle").frame(maxWidth: .infinity) }
                     .buttonStyle(.bordered)
             }
+            .buttonBorderShape(.capsule)
+            .controlSize(.large)
             .disabled(tracks.isEmpty)
         }
         .padding(.vertical, 8)
+        .background(alignment: .top) {
+            // La carátula, difuminada, ilumina la cabecera.
+            Artwork(url: page?.thumbnail ?? item?.thumbnail, corner: 0)
+                .frame(width: 420, height: 320)
+                .blur(radius: 70)
+                .opacity(0.5)
+                .offset(y: -90)
+                .allowsHitTesting(false)
+        }
     }
 
     private func load() async {
@@ -287,8 +304,9 @@ struct ArtistView: View {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(spacing: 12) {
                     Artwork(url: page?.thumbnail ?? item.thumbnail, size: 180, corner: 90)
+                        .shadow(color: .black.opacity(0.5), radius: 24, y: 14)
                     Text(page?.title ?? item.title)
-                        .font(.largeTitle.weight(.bold))
+                        .font(Theme.display(34))
                         .multilineTextAlignment(.center)
                     if let subtitle = page?.subtitle, !subtitle.isEmpty {
                         Text(subtitle).font(.subheadline).foregroundStyle(.secondary)
@@ -321,7 +339,7 @@ struct ArtistView: View {
 
                 if let tracks = page?.tracks, !tracks.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Canciones populares").font(.title3.weight(.bold)).padding(.horizontal)
+                        Text("Canciones populares").font(Theme.display(22, weight: .bold)).padding(.horizontal)
                         ForEach(Array(tracks.enumerated()), id: \.offset) { offset, track in
                             Button { player.play(tracks, startAt: offset) } label: {
                                 TrackRow(track: track, isCurrent: player.current?.id == track.id)
@@ -338,6 +356,16 @@ struct ArtistView: View {
                 }
             }
             .padding(.vertical)
+        }
+        .background(alignment: .top) {
+            ZStack(alignment: .top) {
+                Theme.base
+                Artwork(url: page?.thumbnail ?? item.thumbnail, corner: 0)
+                    .frame(height: 360)
+                    .blur(radius: 80)
+                    .opacity(0.45)
+            }
+            .ignoresSafeArea()
         }
         .overlay { if loading && page == nil { ProgressView() } }
         .navigationTitle(page?.title ?? item.title)

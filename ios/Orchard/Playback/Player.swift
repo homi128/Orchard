@@ -9,6 +9,8 @@ struct ResolvedStream {
     let headers: [String: String]
     let expiresAt: Date
     let tracking: PlaybackTracking?
+    /// Duración real según YouTube. AVPlayer a veces informa el doble en estos archivos.
+    let duration: Double
 }
 
 enum RepeatMode: String, CaseIterable {
@@ -79,6 +81,9 @@ final class Player: ObservableObject {
     private var artwork: (id: String, image: MPMediaItemArtwork)?
     private var endObserver: NSObjectProtocol?
     private let settings = AppSettings.shared
+
+    /// Canción cuyo final ya se procesó, para no avanzar dos veces.
+    private var endedTrackId: String?
 
     // Historial de YouTube
     private var historyCpn = ""
@@ -188,6 +193,7 @@ final class Player: ObservableObject {
 
     func seek(to seconds: Double) {
         if fading { finishFade() }
+        endedTrackId = nil
         let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
         active.player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             Task { @MainActor in self?.updateNowPlaying() }
@@ -307,6 +313,7 @@ final class Player: ObservableObject {
         errorMessage = nil
         position = 0
         duration = track.durationSeconds
+        endedTrackId = nil
         isPlaying = true
         updateNowPlaying()
         refreshLike()
@@ -392,9 +399,10 @@ final class Player: ObservableObject {
             tracking = PlaybackTracking(playbackUrl: playbackUrl, watchtimeUrl: watchtimeUrl,
                                         itag: info["itag"] as? Int ?? 140)
         }
+        let realDuration = (json["durationSeconds"] as? Double) ?? (json["durationSeconds"] as? Int).map(Double.init) ?? 0
         let stream = ResolvedStream(url: url,
                                     headers: ["User-Agent": agent, "Origin": origin, "Referer": origin + "/"],
-                                    expiresAt: expires, tracking: tracking)
+                                    expiresAt: expires, tracking: tracking, duration: realDuration)
         streams[track.id] = stream
         if streams.count > 16, let oldest = streams.keys.first(where: { $0 != track.id }) {
             streams.removeValue(forKey: oldest)
@@ -411,10 +419,11 @@ final class Player: ObservableObject {
                     switch item.status {
                     case .readyToPlay:
                         deck.ready = true
+                        self.clampEnd(of: deck, track: track)
                         if deck === self.active {
                             self.isLoading = false
-                            let seconds = item.duration.seconds
-                            if seconds.isFinite, seconds > 0 { self.duration = seconds }
+                            let seconds = self.trueDuration(of: track, item: item)
+                            if seconds > 0 { self.duration = seconds }
                             self.updateNowPlaying()
                         }
                     case .failed:
@@ -451,6 +460,31 @@ final class Player: ObservableObject {
         ]
     }
 
+    /// Duración verdadera de una canción. Los AAC fragmentados de YouTube hacen que AVPlayer
+    /// informe el doble, así que manda la duración que entrega YouTube (o la del catálogo).
+    private func trueDuration(of track: Track?, item: AVPlayerItem?) -> Double {
+        let reported = item?.duration.seconds ?? .nan
+        let known: Double
+        if let track, let stream = streams[track.id], stream.duration > 0 {
+            known = stream.duration
+        } else {
+            known = track?.durationSeconds ?? 0
+        }
+        guard known > 0 else { return reported.isFinite && reported > 0 ? reported : 0 }
+        if reported.isFinite, abs(reported - known) <= 3 { return reported }
+        return known
+    }
+
+    /// Si AVPlayer cree que el archivo es más largo de lo real, hacer que termine donde corresponde.
+    private func clampEnd(of deck: Deck, track: Track) {
+        guard let item = deck.item else { return }
+        let real = trueDuration(of: track, item: item)
+        let reported = item.duration.seconds
+        if real > 0, reported.isFinite, reported > real + 3 {
+            item.forwardPlaybackEndTime = CMTime(seconds: real, preferredTimescale: 600)
+        }
+    }
+
     private func attachEndObserver() {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         guard let item = active.item else { return }
@@ -461,12 +495,15 @@ final class Player: ObservableObject {
     }
 
     private func trackEnded() {
+        guard let id = current?.id, endedTrackId != id || repeatMode == .one else { return }
+        endedTrackId = id
         if sleepAtEndOfTrack {
             sleepAtEndOfTrack = false
             pause()
             return
         }
         if repeatMode == .one {
+            endedTrackId = nil
             seek(to: 0)
             active.player.play()
             return
@@ -483,8 +520,9 @@ final class Player: ObservableObject {
             active.player.volume = 1
             active.player.play()
             isLoading = !active.ready
-            duration = active.item?.duration.seconds.isFinite == true ? active.item!.duration.seconds : (current?.durationSeconds ?? 0)
+            duration = trueDuration(of: current, item: active.item)
             position = 0
+            endedTrackId = nil
             errorMessage = nil
             attachEndObserver()
             standby.clear()
@@ -535,7 +573,11 @@ final class Player: ObservableObject {
     private func tick() {
         let time = active.player.currentTime().seconds
         if time.isFinite, active.item != nil { position = max(0, time) }
-        if let seconds = active.item?.duration.seconds, seconds.isFinite, seconds > 0 { duration = seconds }
+        if active.ready {
+            let seconds = trueDuration(of: current, item: active.item)
+            if seconds > 0 { duration = seconds }
+        }
+        if duration > 0 { position = min(position, duration) }
 
         if let sleepAt, Date() >= sleepAt {
             self.sleepAt = nil
@@ -544,6 +586,12 @@ final class Player: ObservableObject {
 
         guard isPlaying, active.ready, duration > 0 else { return }
         let remaining = duration - position
+
+        // Respaldo: si el aviso de fin de AVPlayer no llega, terminar al alcanzar la duración real.
+        if remaining <= 0.05, !fading {
+            trackEnded()
+            return
+        }
 
         // Preparar la siguiente con tiempo, y pedir más canciones si la cola se acaba.
         if remaining < max(45, settings.crossfade + 20) {
@@ -598,6 +646,8 @@ final class Player: ObservableObject {
         attachEndObserver()
         isLoading = !active.ready
         errorMessage = nil
+        endedTrackId = nil
+        duration = trueDuration(of: current, item: active.item)
         refreshLike()
         updateNowPlaying()
         saveQueue()
