@@ -54,6 +54,18 @@ jobs:
             build 2>&1 | tee build/xcodebuild.log | grep -E "error:|warning: .*(Swift|swift)|BUILD (SUCCEEDED|FAILED)" || true
           test -d build/dd/Build/Products/Release-iphoneos/Orchard.app
 
+      - name: Revisar el .app
+        working-directory: ios/build/dd/Build/Products/Release-iphoneos/Orchard.app
+        run: |
+          echo "--- Arquitectura"; lipo -info Orchard
+          echo "--- Bytecode del proveedor"; ls -la *.qjc
+          echo "--- Motor dentro del binario"
+          nm -gU Orchard | grep -E "orchard_youtube_extract|JS_NewRuntime" | head
+          echo "--- Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" -c "Print :CFBundleIdentifier" -c "Print :UIBackgroundModes" Info.plist
+          echo "--- Ícono"; ls AppIcon* Assets.car 2>/dev/null || true
+          test -f youtube-provider.qjc && test -f youtube-po-minter.qjc
+
       - name: Armar el .ipa
         working-directory: ios
         run: |
