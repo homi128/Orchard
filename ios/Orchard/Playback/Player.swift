@@ -11,6 +11,8 @@ struct ResolvedStream {
     let tracking: PlaybackTracking?
     /// Duración real según YouTube. AVPlayer a veces informa el doble en estos archivos.
     let duration: Double
+    /// Tamaño del archivo en bytes (0 si YouTube no lo informó).
+    let contentLength: Int64
 }
 
 enum RepeatMode: String, CaseIterable {
@@ -52,6 +54,9 @@ final class Player: ObservableObject {
         var observers: [NSKeyValueObservation] = []
         var ready = false
         var failedOnce = false
+        /// Carga por tramos (StreamLoader) en vez de dejar que AVPlayer pida el archivo solo.
+        var chunked = false
+        var startedAt = Date()
         init() {
             player.automaticallyWaitsToMinimizeStalling = true
             player.actionAtItemEnd = .pause
@@ -340,10 +345,11 @@ final class Player: ObservableObject {
     }
 
     /// Carga `track` en un reproductor. `deck == nil` significa el activo, y empieza a sonar.
-    private func start(_ track: Track, on deck: Deck?, refresh: Bool) async {
+    private func start(_ track: Track, on deck: Deck?, refresh: Bool, direct: Bool = false) async {
         let target = deck ?? active
         do {
-            let asset = try await asset(for: track, refresh: refresh)
+            let loaded = try await asset(for: track, refresh: refresh, direct: direct)
+            let asset = loaded.asset
             guard !Task.isCancelled else { return }
             if deck == nil { guard current?.id == track.id else { return } }
             let item = AVPlayerItem(asset: asset)
@@ -357,6 +363,8 @@ final class Player: ObservableObject {
             target.trackId = track.id
             target.item = item
             target.ready = false
+            target.chunked = loaded.chunked
+            target.startedAt = Date()
             target.player.replaceCurrentItem(with: item)
             observe(target, track: track)
             if deck == nil {
@@ -380,12 +388,17 @@ final class Player: ObservableObject {
         }
     }
 
-    private func asset(for track: Track, refresh: Bool) async throws -> AVURLAsset {
+    /// `direct` deja que AVPlayer pida el archivo por su cuenta: es el plan B si la carga
+    /// por tramos falla en algún stream.
+    private func asset(for track: Track, refresh: Bool, direct: Bool) async throws -> (asset: AVURLAsset, chunked: Bool) {
         if let file = DownloadStore.shared.fileURL(for: track.id) {
-            return AVURLAsset(url: file)
+            return (AVURLAsset(url: file), false)
         }
         let stream = try await resolve(track, refresh: refresh)
-        return AVURLAsset(url: stream.url, options: ["AVURLAssetHTTPHeaderFieldsKey": stream.headers])
+        if !direct, let chunked = StreamLoader.asset(for: stream, id: track.id) {
+            return (chunked, true)
+        }
+        return (AVURLAsset(url: stream.url, options: ["AVURLAssetHTTPHeaderFieldsKey": stream.headers]), false)
     }
 
     func resolve(_ track: Track, refresh: Bool = false) async throws -> ResolvedStream {
@@ -423,7 +436,8 @@ final class Player: ObservableObject {
         let realDuration = (json["durationSeconds"] as? Double) ?? (json["durationSeconds"] as? Int).map(Double.init) ?? 0
         let stream = ResolvedStream(url: url,
                                     headers: ["User-Agent": agent, "Origin": origin, "Referer": origin + "/"],
-                                    expiresAt: expires, tracking: tracking, duration: realDuration)
+                                    expiresAt: expires, tracking: tracking, duration: realDuration,
+                                    contentLength: (json["contentLength"] as? NSNumber)?.int64Value ?? 0)
         streams[track.id] = stream
         if streams.count > 16, let oldest = streams.keys.first(where: { $0 != track.id }) {
             streams.removeValue(forKey: oldest)
@@ -458,11 +472,13 @@ final class Player: ObservableObject {
                             deck.failedOnce = true
                             self.streams[track.id] = nil
                             if deck === self.active {
-                                self.loadTask = Task { [weak self] in await self?.start(track, on: nil, refresh: true) }
+                                self.loadTask = Task { [weak self] in
+                                    await self?.start(track, on: nil, refresh: true, direct: true)
+                                }
                             } else {
                                 self.standbyTask = Task { [weak self, weak deck] in
                                     guard let self, let deck else { return }
-                                    await self.start(track, on: deck, refresh: true)
+                                    await self.start(track, on: deck, refresh: true, direct: true)
                                 }
                             }
                         } else if deck === self.active {
@@ -604,6 +620,14 @@ final class Player: ObservableObject {
             if seconds > 0 { duration = seconds }
         }
         if duration > 0 { position = min(position, duration) }
+
+        // Si la carga por tramos no arranca en 15 s, reintentar con la carga directa.
+        if let track = current, active.item != nil, !active.ready, active.chunked, !active.failedOnce,
+           active.trackId == track.id, Date().timeIntervalSince(active.startedAt) > 15 {
+            active.failedOnce = true
+            loadTask?.cancel()
+            loadTask = Task { [weak self] in await self?.start(track, on: nil, refresh: false, direct: true) }
+        }
 
         if let sleepAt, Date() >= sleepAt {
             self.sleepAt = nil
