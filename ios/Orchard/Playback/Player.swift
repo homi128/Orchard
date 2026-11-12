@@ -62,6 +62,8 @@ final class Player: ObservableObject {
         var chunked = false
         var startedAt = Date()
         var report = ""
+        /// Hay una carga en curso para este reproductor.
+        var loading = false
         init() {
             // Empezar a sonar con lo que haya, sin esperar a acumular medio minuto de audio.
             player.automaticallyWaitsToMinimizeStalling = false
@@ -82,6 +84,16 @@ final class Player: ObservableObject {
     private var active = Deck()
     private var standby = Deck()
     private var streams: [String: ResolvedStream] = [:]
+    /// Orden en que se resolvieron los streams, para descartar siempre el más antiguo.
+    private var streamOrder: [String] = []
+    /// Duración real de cada canción ya resuelta. No se descarta junto con el stream:
+    /// sin ella AVPlayer vuelve a mostrar el doble.
+    private var realDurations: [String: Double] = [:]
+    /// Para detectar que el audio se quedó detenido.
+    private var lastAdvance = Date()
+    private var lastPosition: Double = -1
+    private var stallHandledFor: String?
+    private var refillFailedAt: Date?
     private var loadTask: Task<Void, Never>?
     private var standbyTask: Task<Void, Never>?
     private var ticker: Timer?
@@ -161,6 +173,8 @@ final class Player: ObservableObject {
 
     func toggle() {
         if active.item == nil {
+            // Todavía resolviendo: solo anotar si debe sonar cuando esté lista.
+            if isLoading { isPlaying.toggle(); return }
             if current != nil { loadCurrent() }
             return
         }
@@ -168,6 +182,7 @@ final class Player: ObservableObject {
     }
 
     func resume() {
+        lastAdvance = Date()
         try? AVAudioSession.sharedInstance().setActive(true)
         active.player.play()
         if fading { standby.player.play() }
@@ -186,7 +201,8 @@ final class Player: ObservableObject {
         guard current != nil else { return }
         if fading { finishFade(); return }
         if queue.indices.contains(index + 1) {
-            advance(using: standby.trackId == queue[index + 1].id && standby.ready)
+            // Si la siguiente ya se está preparando, seguir con esa carga en vez de empezar otra.
+            advance(using: standby.trackId == queue[index + 1].id && (standby.item != nil || standby.loading))
         } else if repeatMode == .all, !queue.isEmpty {
             finishHistory()
             index = 0
@@ -209,6 +225,7 @@ final class Player: ObservableObject {
     func seek(to seconds: Double) {
         if fading { finishFade() }
         endedTrackId = nil
+        lastAdvance = Date()
         let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
         active.player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             Task { @MainActor in self?.updateNowPlaying() }
@@ -340,6 +357,9 @@ final class Player: ObservableObject {
         position = 0
         duration = track.durationSeconds
         endedTrackId = nil
+        lastAdvance = Date()
+        lastPosition = -1
+        loadReport = ""
         resumeAt = nil
         isPlaying = true
         updateNowPlaying()
@@ -354,17 +374,21 @@ final class Player: ObservableObject {
     private func start(_ track: Track, on deck: Deck?, refresh: Bool, direct: Bool = false) async {
         let target = deck ?? active
         let began = Date()
+        target.loading = true
+        defer { target.loading = false }
         do {
             let loaded = try await asset(for: track, refresh: refresh, direct: direct)
             let asset = loaded.asset
             guard !Task.isCancelled else { return }
-            if deck == nil { guard current?.id == track.id else { return } }
+            // El reproductor de reserva puede haber pasado a ser el activo mientras cargaba
+            // (si se tocó "siguiente"): decidir por lo que es ahora, no por lo que era.
+            if target === active { guard current?.id == track.id else { return } }
             let item = AVPlayerItem(asset: asset)
             item.preferredForwardBufferDuration = 30
             if settings.eqEnabled {
                 await Equalizer.attach(to: item, asset: asset)
                 guard !Task.isCancelled else { return }
-                if deck == nil { guard current?.id == track.id else { return } }
+                if target === active { guard current?.id == track.id else { return } }
             }
             target.observers = []
             target.trackId = track.id
@@ -377,10 +401,10 @@ final class Player: ObservableObject {
                 + (loaded.chunked ? "" : " · carga directa")
             target.player.replaceCurrentItem(with: item)
             observe(target, track: track)
-            if deck == nil {
+            if target === active {
                 try? AVAudioSession.sharedInstance().setActive(true)
                 target.player.volume = 1
-                target.player.play()
+                if isPlaying { target.player.play() }
                 attachEndObserver()
                 updateNowPlaying()
             } else {
@@ -389,7 +413,7 @@ final class Player: ObservableObject {
             }
         } catch {
             guard !Task.isCancelled else { return }
-            if deck == nil, current?.id == track.id {
+            if target === active, current?.id == track.id {
                 isLoading = false
                 isPlaying = false
                 errorMessage = error.localizedDescription
@@ -405,10 +429,26 @@ final class Player: ObservableObject {
             return (AVURLAsset(url: file), false)
         }
         let stream = try await resolve(track, refresh: refresh)
-        if !direct, let chunked = StreamLoader.asset(for: stream, id: track.id) {
+        if !direct, let chunked = StreamLoader.asset(
+            for: stream, id: track.id,
+            refresh: { [weak self] in try? await self?.resolve(track, refresh: true) },
+            report: { [weak self] message, final in
+                Task { @MainActor in self?.loaderReported(message, final: final, trackId: track.id) }
+            }) {
             return (chunked, true)
         }
         return (AVURLAsset(url: stream.url, options: ["AVURLAssetHTTPHeaderFieldsKey": stream.headers]), false)
+    }
+
+    /// El cargador avisa de cortes de YouTube. Queda en el diagnóstico y, si ya no hay más
+    /// que intentar, se muestra como error de la canción.
+    private func loaderReported(_ message: String, final: Bool, trackId: String) {
+        guard current?.id == trackId else { return }
+        loadReport = loadReport.isEmpty ? message : loadReport + "\n" + message
+        if final {
+            errorMessage = message
+            isLoading = false
+        }
     }
 
     func resolve(_ track: Track, refresh: Bool = false) async throws -> ResolvedStream {
@@ -474,8 +514,24 @@ final class Player: ObservableObject {
             timed.timing = String(format: "YouTube %.1f s", elapsed)
         }
         streams[track.id] = timed
-        if streams.count > 16, let oldest = streams.keys.first(where: { $0 != track.id }) {
-            streams.removeValue(forKey: oldest)
+        streamOrder.removeAll { $0 == track.id }
+        streamOrder.append(track.id)
+        // Descartar los más antiguos, pero nunca el que suena ni el que está preparado.
+        while streamOrder.count > 24, let oldest = streamOrder.first(where: {
+            $0 != track.id && $0 != current?.id && $0 != active.trackId && $0 != standby.trackId
+        }) {
+            streamOrder.removeAll { $0 == oldest }
+            streams[oldest] = nil
+        }
+        if realDuration > 0 {
+            realDurations[track.id] = realDuration
+            if realDurations.count > 600, let any = realDurations.keys.first(where: { $0 != track.id && $0 != current?.id }) {
+                realDurations[any] = nil
+            }
+            // Anotar la duración en la cola si el catálogo no la traía.
+            for position in queue.indices where queue[position].id == track.id && queue[position].durationSeconds <= 0 {
+                queue[position].durationSeconds = realDuration
+            }
         }
         return timed
     }
@@ -545,7 +601,9 @@ final class Player: ObservableObject {
     private func trueDuration(of track: Track?, item: AVPlayerItem?) -> Double {
         let reported = item?.duration.seconds ?? .nan
         let known: Double
-        if let track, let stream = streams[track.id], stream.duration > 0 {
+        if let track, let real = realDurations[track.id], real > 0 {
+            known = real
+        } else if let track, let stream = streams[track.id], stream.duration > 0 {
             known = stream.duration
         } else {
             known = track?.durationSeconds ?? 0
@@ -596,13 +654,20 @@ final class Player: ObservableObject {
         finishHistory()
         index += 1
         if prepared {
+            loadTask?.cancel()
             swapDecks()
+            loadTask = standbyTask
+            standbyTask = nil
+            isPlaying = true
             active.player.volume = 1
-            active.player.play()
+            if active.item != nil { active.player.play() }
             isLoading = !active.ready
+            loadReport = active.ready ? active.report + " · precargada" : ""
             duration = trueDuration(of: current, item: active.item)
             position = 0
             endedTrackId = nil
+            lastAdvance = Date()
+            lastPosition = -1
             errorMessage = nil
             attachEndObserver()
             standby.clear()
@@ -688,9 +753,27 @@ final class Player: ObservableObject {
             return
         }
 
-        // Preparar la siguiente con tiempo, y pedir más canciones si la cola se acaba.
-        if remaining < max(45, settings.crossfade + 20) {
-            if upcoming.isEmpty, repeatMode == .off, settings.autoplay, !refilling {
+        // El audio debería avanzar. Si lleva 8 s detenido sin que nadie lo pausara, avisar.
+        if abs(position - lastPosition) > 0.05 {
+            lastPosition = position
+            lastAdvance = Date()
+            if stallHandledFor != nil, stallHandledFor == current?.id {
+                // Volvió a sonar: quitar el aviso.
+                stallHandledFor = nil
+                if errorMessage?.hasPrefix("El audio se detuvo") == true { errorMessage = nil }
+            }
+        } else if Date().timeIntervalSince(lastAdvance) > 8, stallHandledFor != current?.id, remaining > 2 {
+            stallHandledFor = current?.id
+            if errorMessage == nil {
+                errorMessage = "El audio se detuvo. Toca siguiente o vuelve a tocar la canción."
+            }
+        }
+
+        // Apenas la canción arranca, dejar lista la siguiente: así "siguiente" es inmediato.
+        // Y si la cola se acaba, pedir más canciones con tiempo.
+        if position > 2 {
+            if upcoming.isEmpty, repeatMode == .off, settings.autoplay, !refilling,
+               refillFailedAt.map({ Date().timeIntervalSince($0) > 30 }) ?? true {
                 Task { await refill(thenAdvance: false) }
             }
             prepareStandby()
@@ -801,6 +884,7 @@ final class Player: ObservableObject {
             saveQueue()
             if thenAdvance { advance(using: false) }
         } catch {
+            refillFailedAt = Date()
             if thenAdvance {
                 pause()
                 errorMessage = error.localizedDescription
