@@ -13,6 +13,8 @@ struct ResolvedStream {
     let duration: Double
     /// Tamaño del archivo en bytes (0 si YouTube no lo informó).
     let contentLength: Int64
+    /// Cuánto tardó YouTube en entregar el stream, para el diagnóstico.
+    var timing = ""
 }
 
 enum RepeatMode: String, CaseIterable {
@@ -43,6 +45,8 @@ final class Player: ObservableObject {
     @Published private(set) var sleepAt: Date?
     @Published private(set) var sleepAtEndOfTrack = false
     @Published private(set) var liked = false
+    /// Tiempos de la última carga (se muestra si se activa el diagnóstico en Ajustes).
+    @Published private(set) var loadReport = ""
 
     var current: Track? { queue.indices.contains(index) ? queue[index] : nil }
     var upcoming: [Track] { queue.indices.contains(index + 1) ? Array(queue[(index + 1)...]) : [] }
@@ -57,8 +61,10 @@ final class Player: ObservableObject {
         /// Carga por tramos (StreamLoader) en vez de dejar que AVPlayer pida el archivo solo.
         var chunked = false
         var startedAt = Date()
+        var report = ""
         init() {
-            player.automaticallyWaitsToMinimizeStalling = true
+            // Empezar a sonar con lo que haya, sin esperar a acumular medio minuto de audio.
+            player.automaticallyWaitsToMinimizeStalling = false
             player.actionAtItemEnd = .pause
         }
         func clear() {
@@ -347,6 +353,7 @@ final class Player: ObservableObject {
     /// Carga `track` en un reproductor. `deck == nil` significa el activo, y empieza a sonar.
     private func start(_ track: Track, on deck: Deck?, refresh: Bool, direct: Bool = false) async {
         let target = deck ?? active
+        let began = Date()
         do {
             let loaded = try await asset(for: track, refresh: refresh, direct: direct)
             let asset = loaded.asset
@@ -365,6 +372,9 @@ final class Player: ObservableObject {
             target.ready = false
             target.chunked = loaded.chunked
             target.startedAt = Date()
+            target.report = String(format: "%@ · preparar %.1f s", streams[track.id]?.timing ?? "sin conexión",
+                                   Date().timeIntervalSince(began))
+                + (loaded.chunked ? "" : " · carga directa")
             target.player.replaceCurrentItem(with: item)
             observe(target, track: track)
             if deck == nil {
@@ -408,15 +418,30 @@ final class Player: ObservableObject {
         guard let session = SessionStore.shared.session else {
             throw ProviderError(message: "Inicia sesión en YouTube Music para reproducir canciones.")
         }
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "session": session.providerJSON,
-            "track": track.providerJSON,
             "streamQuality": settings.quality.rawValue,
             "refreshStream": refresh,
             // AVPlayer abre AAC en MP4 de forma nativa; Opus en WebM no.
             "audioMimeTypes": ["audio/mp4; codecs=\"mp4a.40.2\"", "audio/mp4; codecs=\"mp4a.40.5\""],
         ]
-        let json = try await Provider.object("playback.resolve", payload)
+        let began = Date()
+        var json: [String: Any]
+        if track.isMusicVideoOfSong {
+            // Un video musical de una canción: intentar su versión de estudio; si el proveedor
+            // no puede o se niega, reproducir el audio del video tal cual.
+            payload["track"] = track.playbackJSON(asIs: false)
+            do {
+                json = try await Provider.object("playback.resolve", payload)
+            } catch {
+                payload["track"] = track.playbackJSON(asIs: true)
+                json = try await Provider.object("playback.resolve", payload)
+            }
+        } else {
+            payload["track"] = track.playbackJSON(asIs: true)
+            json = try await Provider.object("playback.resolve", payload)
+        }
+        let elapsed = Date().timeIntervalSince(began)
         guard let text = json["url"] as? String, let url = URL(string: text) else {
             throw ProviderError(message: "YouTube no entregó el audio de esta canción.")
         }
@@ -438,11 +463,21 @@ final class Player: ObservableObject {
                                     headers: ["User-Agent": agent, "Origin": origin, "Referer": origin + "/"],
                                     expiresAt: expires, tracking: tracking, duration: realDuration,
                                     contentLength: (json["contentLength"] as? NSNumber)?.int64Value ?? 0)
-        streams[track.id] = stream
+        var timed = stream
+        if let timings = json["timings"] as? [String: Any] {
+            func seconds(_ key: String) -> String {
+                String(format: "%.1f", ((timings[key] as? NSNumber)?.doubleValue ?? 0) / 1000)
+            }
+            timed.timing = String(format: "YouTube %.1f s", elapsed)
+                + " (reproductor \(seconds("playerMs")), red \(seconds("requestMs")), token \(seconds("tokenMs")), tamaño \(seconds("probeMs")))"
+        } else {
+            timed.timing = String(format: "YouTube %.1f s", elapsed)
+        }
+        streams[track.id] = timed
         if streams.count > 16, let oldest = streams.keys.first(where: { $0 != track.id }) {
             streams.removeValue(forKey: oldest)
         }
-        return stream
+        return timed
     }
 
     private func observe(_ deck: Deck, track: Track) {
@@ -459,6 +494,9 @@ final class Player: ObservableObject {
                             self.isLoading = false
                             let seconds = self.trueDuration(of: track, item: item)
                             if seconds > 0 { self.duration = seconds }
+                            self.loadReport = deck.report
+                                + String(format: " · audio listo %.1f s", Date().timeIntervalSince(deck.startedAt))
+                            if self.isPlaying { deck.player.playImmediately(atRate: 1) }
                             if let target = self.resumeAt {
                                 self.resumeAt = nil
                                 self.seek(to: target)
@@ -636,6 +674,13 @@ final class Player: ObservableObject {
 
         guard isPlaying, active.ready, duration > 0 else { return }
         let remaining = duration - position
+
+        // Sin la espera automática, si el audio se queda corto AVPlayer se detiene:
+        // retomarlo apenas vuelva a haber datos.
+        if active.player.rate == 0, !fading, remaining > 0.5,
+           let item = active.item, item.isPlaybackLikelyToKeepUp || item.isPlaybackBufferFull {
+            active.player.playImmediately(atRate: 1)
+        }
 
         // Respaldo: si el aviso de fin de AVPlayer no llega, terminar al alcanzar la duración real.
         if remaining <= 0.05, !fading {

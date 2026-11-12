@@ -26,6 +26,9 @@ final class AppSettings: ObservableObject {
     @Published var downloadOnCellular: Bool { didSet { defaults.set(downloadOnCellular, forKey: "downloadOnCellular") } }
     @Published var recentSearches: [String] { didSet { defaults.set(recentSearches, forKey: "recentSearches") } }
 
+    /// Mostrar en el reproductor cuánto tardó cada parte de la carga.
+    @Published var showTimings: Bool { didSet { defaults.set(showTimings, forKey: "showTimings") } }
+
     // Ecualizador
     @Published var eqEnabled: Bool { didSet { defaults.set(eqEnabled, forKey: "eqEnabled"); pushEqualizer() } }
     /// true = modo completo de 10 bandas; false = graves, medios y agudos.
@@ -51,6 +54,7 @@ final class AppSettings: ObservableObject {
         sendHistory = defaults.object(forKey: "sendHistory") as? Bool ?? true
         downloadOnCellular = defaults.object(forKey: "downloadOnCellular") as? Bool ?? true
         recentSearches = defaults.stringArray(forKey: "recentSearches") ?? []
+        showTimings = defaults.bool(forKey: "showTimings")
         eqEnabled = defaults.bool(forKey: "eqEnabled")
         eqFull = defaults.bool(forKey: "eqFull")
         let simple = defaults.array(forKey: "eqSimple") as? [Double] ?? []

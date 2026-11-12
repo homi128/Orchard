@@ -169,6 +169,14 @@ struct NowPlayingView: View {
                 if let message = player.errorMessage {
                     Text(message).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center).padding(.horizontal)
                 }
+                if settings.showTimings, !player.loadReport.isEmpty {
+                    Text(player.loadReport)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                        .textSelection(.enabled)
+                }
 
                 VStack(spacing: 2) {
                     Scrubber(position: player.position, duration: player.duration,

@@ -56,6 +56,25 @@ struct Track: Identifiable, Hashable, Codable {
         return json
     }
 
+    /// Lo que se le pide reproducir al proveedor.
+    ///
+    /// El proveedor, si no sabe que algo ya es la pista de audio, busca primero la "versión de
+    /// audio" de la canción (una búsqueda extra en YouTube) y, si es un video, se niega a
+    /// reproducirlo cuando la duración no calza exacto con la del catálogo. Aquí la persona ya
+    /// eligió qué quiere oír, así que `asIs` pide exactamente eso, sin búsqueda ni control.
+    func playbackJSON(asIs: Bool) -> [String: Any] {
+        var json = providerJSON
+        guard asIs, !isUpload else { return json }
+        json["type"] = "track"
+        json["musicVideoType"] = "MUSIC_VIDEO_TYPE_ATV"
+        return json
+    }
+
+    /// Canción publicada como video musical: vale la pena buscar su versión de estudio.
+    var isMusicVideoOfSong: Bool {
+        type != "video" && ["MUSIC_VIDEO_TYPE_OMV", "MUSIC_VIDEO_TYPE_UGC"].contains(musicVideoType)
+    }
+
     /// Carátula más grande para la pantalla del reproductor.
     var largeThumbnail: URL? {
         guard let url = thumbnail else { return fallbackThumbnail }

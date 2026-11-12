@@ -562,6 +562,12 @@ struct SettingsView: View {
                 Text("Lo que escuchas aparece en tu historial y mejora tus recomendaciones, igual que en la app oficial.")
             }
 
+            Section {
+                Toggle("Mostrar tiempos de carga", isOn: $settings.showTimings)
+            } footer: {
+                Text("Muestra en el reproductor cuánto tardó cada parte al cargar una canción. Sirve para encontrar qué la demora.")
+            }
+
             Section("Cuenta") {
                 if sessions.isSignedIn {
                     Button("Cerrar sesión de YouTube Music", role: .destructive) { confirmSignOut = true }

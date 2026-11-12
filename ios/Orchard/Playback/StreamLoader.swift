@@ -25,6 +25,10 @@ final class StreamLoader: NSObject, AVAssetResourceLoaderDelegate {
     private let bytesPerSecond: Double
     private let queue = DispatchQueue(label: "orchard.stream.loader")
     private var tasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+    /// El comienzo del archivo, pedido apenas se crea el cargador. AVPlayer hace varios
+    /// pedidos chicos al inicio (2 bytes, cabecera, primer audio): todos salen de aquí,
+    /// sin ir a la red cada vez.
+    private var head: Task<Data?, Never>!
 
     private static let firstChunk: Int64 = 256 * 1024
     private static let chunk: Int64 = 1024 * 1024
@@ -36,6 +40,17 @@ final class StreamLoader: NSObject, AVAssetResourceLoaderDelegate {
         headers = stream.headers
         contentLength = stream.contentLength
         bytesPerSecond = stream.duration > 0 ? Double(stream.contentLength) / stream.duration : 0
+        super.init()
+        let length = min(Self.firstChunk, contentLength)
+        head = Task { [url, headers] in
+            var fetch = URLRequest(url: url)
+            for (name, value) in headers { fetch.setValue(value, forHTTPHeaderField: name) }
+            fetch.setValue("bytes=0-\(length - 1)", forHTTPHeaderField: "Range")
+            guard let (data, response) = try? await Self.session.data(for: fetch),
+                  let http = response as? HTTPURLResponse,
+                  http.statusCode == 206 || http.statusCode == 200, !data.isEmpty else { return nil }
+            return Data(data.prefix(Int(length)))
+        }
     }
 
     /// Un asset que lee a través de este cargador, o nil si falta el tamaño del archivo.
@@ -85,9 +100,18 @@ final class StreamLoader: NSObject, AVAssetResourceLoaderDelegate {
         guard let dataRequest = request.dataRequest else { return }
         var offset = start
         var served: Int64 = 0
+        // Lo que caiga dentro del comienzo ya descargado se entrega desde memoria.
+        if offset < Self.firstChunk, let data = await head.value, offset < Int64(data.count) {
+            if Task.isCancelled || request.isCancelled { return }
+            let upper = min(end, Int64(data.count))
+            let slice = data.subdata(in: Int(offset)..<Int(upper))
+            dataRequest.respond(with: slice)
+            offset = upper
+            served += Int64(slice.count)
+        }
         while offset < end {
             if Task.isCancelled || request.isCancelled { return }
-            let size = served == 0 ? Self.firstChunk : Self.chunk
+            let size = served < Self.firstChunk ? Self.firstChunk : Self.chunk
             let last = min(offset + size, end) - 1
             var fetch = URLRequest(url: url)
             for (name, value) in headers { fetch.setValue(value, forHTTPHeaderField: name) }
