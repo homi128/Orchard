@@ -231,6 +231,7 @@ final class Player: ObservableObject {
             Task { @MainActor in self?.updateNowPlaying() }
         }
         position = max(0, seconds)
+        StreamLoader.note(playhead: position, for: active.item?.asset)
     }
 
     func jump(toQueueIndex newIndex: Int) {
@@ -444,7 +445,9 @@ final class Player: ObservableObject {
     /// que intentar, se muestra como error de la canción.
     private func loaderReported(_ message: String, final: Bool, trackId: String) {
         guard current?.id == trackId else { return }
-        loadReport = loadReport.isEmpty ? message : loadReport + "\n" + message
+        // Solo las últimas líneas: con varios tramos en paralelo los avisos se acumulan.
+        let lines = (loadReport.isEmpty ? [] : loadReport.components(separatedBy: "\n")) + [message]
+        loadReport = lines.suffix(6).joined(separator: "\n")
         if final {
             errorMessage = message
             isLoading = false
@@ -718,6 +721,7 @@ final class Player: ObservableObject {
     private func tick() {
         let time = active.player.currentTime().seconds
         if time.isFinite, active.item != nil { position = max(0, time) }
+        StreamLoader.note(playhead: position, for: active.item?.asset)
         if active.ready {
             let seconds = trueDuration(of: current, item: active.item)
             if seconds > 0 { duration = seconds }

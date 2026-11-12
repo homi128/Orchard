@@ -1,38 +1,46 @@
 import AVFoundation
 import ObjectiveC
 
-/// Entrega el audio de YouTube a AVPlayer con pedidos acotados.
+/// Entrega el audio de YouTube a AVPlayer en tramos cortos e independientes.
 ///
-/// YouTube frena al mínimo cualquier pedido sin final definido ("desde aquí hasta el
-/// final"), que es lo que AVPlayer pide por su cuenta. Android y escritorio piden el rango
-/// completo con principio y fin (PlayerStreams.bounded) y lo reciben de inmediato; este
-/// cargador hace lo mismo: por cada lectura de AVPlayer, un solo pedido "bytes=a-b" que se
-/// va entregando a medida que llega.
-///
-/// Si un pedido se corta, sigue una escalera: reintentar, renovar el enlace (nuevo token) y,
-/// como último recurso, pedir sin final definido, que es lento pero es lo que usaba antes.
+/// Una sola conexión larga resultó frágil en el iPhone: YouTube (o la red) la corta a los
+/// pocos megabytes y con ella se queda la canción entera en silencio. Aquí el archivo se baja
+/// en tramos de 256 KB, como hace la caché de Android (StreamCache.fetchByRanges): cada tramo
+/// es un pedido "bytes=a-b" que termina en menos de un segundo, varios van en paralelo por
+/// delante de lo que suena, y si uno falla se reintenta solo ese, con una conexión nueva y,
+/// si hace falta, con un enlace renovado. Un corte cuesta un reintento, no la canción.
 final class StreamLoader: NSObject, AVAssetResourceLoaderDelegate {
     private static let scheme = "orchard-stream"
     private static var associationKey: UInt8 = 0
+
+    private static let chunkBytes: Int64 = 256 * 1024
+    /// Tramos que se piden por adelantado mientras se entrega el actual.
+    private static let readAhead = 4
+    /// Cuánto se baja por delante de lo que está sonando.
+    private static let window: Int64 = 8 * 1024 * 1024
+    /// Lo que un pedido recibe siempre sin esperas, suene donde suene.
+    private static let freePass: Int64 = 2 * 1024 * 1024
+    /// Tramos en memoria como máximo (24 MB); en videos largos se sueltan los más lejanos.
+    private static let maxChunks = 96
+    /// Esperas entre reintentos de un mismo tramo. Uno más que esperas: 9 intentos.
+    private static let backoff: [Double] = [0.2, 0.5, 1, 1.5, 2, 3, 4, 5]
 
     private let lock = NSLock()
     private var url: URL
     private var headers: [String: String]
     private let contentLength: Int64
-    /// Bytes por segundo de audio, para dosificar las canciones largas.
     private let bytesPerSecond: Double
     private let queue = DispatchQueue(label: "orchard.stream.loader")
     private var tasks: [ObjectIdentifier: Task<Void, Never>] = [:]
-    private var head: Task<Data?, Never>!
+    private var chunks: [Int: Data] = [:]
+    private var inflight: [Int: Task<Data, Error>] = [:]
+    private var lastServed = 0
+    private var playhead: Double = 0
+    private var renewedAt: Date?
     /// Pide un enlace nuevo al proveedor (con token renovado).
     private let refresh: () async -> ResolvedStream?
     /// Avisa de cada tropiezo; el último argumento indica si ya no hay nada más que intentar.
     private let report: (String, Bool) -> Void
-    private var refreshed = false
-
-    private static let headBytes: Int64 = 256 * 1024
-    /// Lo que se baja sin pausas antes de empezar a dosificar.
-    private static let burst: Int64 = 8 * 1024 * 1024
 
     private init(stream: ResolvedStream, refresh: @escaping () async -> ResolvedStream?,
                  report: @escaping (String, Bool) -> Void) {
@@ -43,17 +51,8 @@ final class StreamLoader: NSObject, AVAssetResourceLoaderDelegate {
         self.refresh = refresh
         self.report = report
         super.init()
-        let length = min(Self.headBytes, contentLength)
-        let request = makeRequest(from: 0, to: length, openEnded: false)
-        head = Task {
-            var data = Data()
-            do {
-                for try await piece in StreamHTTP.shared.stream(request).pieces { data.append(piece) }
-            } catch {
-                return data.isEmpty ? nil : data
-            }
-            return data.isEmpty ? nil : Data(data.prefix(Int(length)))
-        }
+        // El comienzo se pide de inmediato, antes de que AVPlayer lo solicite.
+        prefetch(from: 0, upTo: contentLength)
     }
 
     /// Un asset que lee a través de este cargador, o nil si falta el tamaño del archivo.
@@ -70,17 +69,16 @@ final class StreamLoader: NSObject, AVAssetResourceLoaderDelegate {
         return asset
     }
 
-    private func makeRequest(from offset: Int64, to end: Int64, openEnded: Bool) -> URLRequest {
-        lock.lock()
-        let currentURL = url
-        let currentHeaders = headers
-        lock.unlock()
-        var request = URLRequest(url: currentURL)
-        for (name, value) in currentHeaders { request.setValue(value, forHTTPHeaderField: name) }
-        request.setValue(openEnded ? "bytes=\(offset)-" : "bytes=\(offset)-\(end - 1)", forHTTPHeaderField: "Range")
-        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-        return request
+    /// Avisa por dónde va la reproducción (o adónde se adelantó), para bajar lo que viene.
+    static func note(playhead seconds: Double, for asset: AVAsset?) {
+        guard let asset,
+              let loader = objc_getAssociatedObject(asset, &associationKey) as? StreamLoader else { return }
+        loader.lock.lock()
+        loader.playhead = seconds
+        loader.lock.unlock()
     }
+
+    // MARK: - Pedidos de AVPlayer
 
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader,
                         shouldWaitForLoadingOfRequestedResource request: AVAssetResourceLoadingRequest) -> Bool {
@@ -117,171 +115,241 @@ final class StreamLoader: NSObject, AVAssetResourceLoaderDelegate {
         String(format: "%.1f MB", Double(bytes) / 1_048_576)
     }
 
+    /// Hasta qué byte conviene tener bajado según lo que está sonando.
+    private func allowedLimit() -> Int64 {
+        guard bytesPerSecond > 0 else { return .max }
+        lock.lock()
+        let seconds = playhead
+        lock.unlock()
+        return Int64(seconds * bytesPerSecond) + Self.window
+    }
+
     private func serve(_ request: AVAssetResourceLoadingRequest, from start: Int64, to end: Int64) async {
         guard let dataRequest = request.dataRequest else { return }
         var offset = start
-
-        // Lo que caiga dentro del comienzo ya descargado se entrega desde memoria.
-        if offset < Self.headBytes, let data = await head.value, offset < Int64(data.count) {
-            if Task.isCancelled || request.isCancelled { return }
-            let upper = min(end, Int64(data.count))
-            dataRequest.respond(with: data.subdata(in: Int(offset)..<Int(upper)))
-            offset = upper
-        }
-
-        let began = Date()
         var delivered: Int64 = 0
-        var failures = 0
-        var openEnded = false
         while offset < end {
             if Task.isCancelled || request.isCancelled { return }
-            let connection = StreamHTTP.shared.stream(makeRequest(from: offset, to: end, openEnded: openEnded))
+            // Videos largos: no bajar la hora entera de una vez, solo lo que viene.
+            if delivered > Self.freePass {
+                while offset > allowedLimit() {
+                    try? await Task.sleep(nanoseconds: 400_000_000)
+                    if Task.isCancelled || request.isCancelled { return }
+                }
+            }
+            let index = Int(offset / Self.chunkBytes)
+            prefetch(from: index + 1, upTo: min(end, max(allowedLimit(), offset + Self.freePass)))
             do {
-                for try await piece in connection.pieces {
-                    if Task.isCancelled || request.isCancelled {
-                        connection.cancel()
-                        return
-                    }
-                    let usable = piece.prefix(Int(end - offset))
-                    guard !usable.isEmpty else { continue }
-                    dataRequest.respond(with: Data(usable))
-                    offset += Int64(usable.count)
-                    delivered += Int64(usable.count)
-                    if offset >= end {
-                        connection.cancel()
-                        break
-                    }
-                    // Canciones largas: pasada la ráfaga inicial, no bajar más de unas 4 veces
-                    // la velocidad de reproducción, para no llenar la memoria con una hora de audio.
-                    if delivered > Self.burst, bytesPerSecond > 0 {
-                        let allowed = Double(Self.burst) + Date().timeIntervalSince(began) * bytesPerSecond * 4
-                        if Double(delivered) > allowed {
-                            connection.suspend()
-                            let wait = min((Double(delivered) - allowed) / (bytesPerSecond * 4), 15)
-                            try? await Task.sleep(nanoseconds: UInt64(max(wait, 0.2) * 1_000_000_000))
-                            connection.resume()
-                        }
-                    }
-                }
-                if offset < end {
-                    // El servidor cerró antes de entregar todo: tratarlo como un corte.
-                    throw StreamHTTP.Failure.truncated
-                }
+                let data = try await chunk(index)
+                if Task.isCancelled || request.isCancelled { return }
+                let base = Int64(index) * Self.chunkBytes
+                let lower = Int(offset - base)
+                let upper = Int(min(end, base + Int64(data.count)) - base)
+                guard upper > lower else { throw StreamHTTP.Failure.truncated("") }
+                dataRequest.respond(with: data.subdata(in: lower..<upper))
+                offset += Int64(upper - lower)
+                delivered += Int64(upper - lower)
             } catch {
                 if Task.isCancelled || request.isCancelled { return }
-                failures += 1
                 let reason = (error as? StreamHTTP.Failure)?.text ?? error.localizedDescription
-                let place = megabytes(offset)
-                switch failures {
-                case 1:
-                    report("corte en \(place): \(reason), reintentando", false)
-                    try? await Task.sleep(nanoseconds: 300_000_000)
-                case 2:
-                    report("corte en \(place): \(reason), renovando el enlace", false)
-                    if let fresh = await refresh() {
-                        lock.lock()
-                        url = fresh.url
-                        headers = fresh.headers
-                        refreshed = true
-                        lock.unlock()
-                    }
-                case 3:
-                    report("corte en \(place): \(reason), probando sin rango acotado", false)
-                    openEnded = true
-                default:
-                    report("YouTube dejó de entregar el audio en \(place): \(reason)", true)
-                    request.finishLoading(with: error)
-                    return
-                }
+                report("YouTube dejó de entregar el audio en \(megabytes(offset)): \(reason)", true)
+                request.finishLoading(with: error)
+                return
             }
         }
         if !request.isCancelled { request.finishLoading() }
     }
+
+    // MARK: - Tramos
+
+    private func prefetch(from first: Int, upTo limit: Int64) {
+        guard first >= 0 else { return }
+        for index in first..<(first + Self.readAhead) {
+            guard Int64(index) * Self.chunkBytes < min(limit, contentLength) else { return }
+            _ = task(for: index, serving: false)
+        }
+    }
+
+    /// La descarga (en curso o nueva) del tramo `index`; nil si ya está en memoria.
+    private func task(for index: Int, serving: Bool) -> Task<Data, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        if serving { lastServed = index }
+        if chunks[index] != nil { return nil }
+        if let running = inflight[index] { return running }
+        let created = Task<Data, Error> { [weak self] in
+            guard let self else { throw CancellationError() }
+            do {
+                let data = try await self.download(index)
+                self.store(data, at: index)
+                return data
+            } catch {
+                self.lock.lock()
+                self.inflight[index] = nil
+                self.lock.unlock()
+                throw error
+            }
+        }
+        inflight[index] = created
+        return created
+    }
+
+    private func chunk(_ index: Int) async throws -> Data {
+        if let running = task(for: index, serving: true) { return try await running.value }
+        lock.lock()
+        let cached = chunks[index]
+        lock.unlock()
+        if let cached { return cached }
+        // Lo soltaron de la memoria justo ahora: pedirlo de nuevo.
+        guard let again = task(for: index, serving: true) else { throw StreamHTTP.Failure.truncated("") }
+        return try await again.value
+    }
+
+    private func store(_ data: Data, at index: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        chunks[index] = data
+        inflight[index] = nil
+        guard chunks.count > Self.maxChunks else { return }
+        // Soltar los tramos más lejanos de lo que se está leyendo; el primero tiene el índice
+        // del archivo y se conserva siempre.
+        let center = lastServed
+        let farthest = chunks.keys.filter { $0 != 0 && $0 != index }
+            .sorted { abs($0 - center) > abs($1 - center) }
+        for key in farthest.prefix(chunks.count - Self.maxChunks) { chunks[key] = nil }
+    }
+
+    private func makeRequest(from lower: Int64, to upper: Int64) -> URLRequest {
+        lock.lock()
+        let currentURL = url
+        let currentHeaders = headers
+        lock.unlock()
+        var request = URLRequest(url: currentURL)
+        for (name, value) in currentHeaders { request.setValue(value, forHTTPHeaderField: name) }
+        request.setValue("bytes=\(lower)-\(upper - 1)", forHTTPHeaderField: "Range")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        return request
+    }
+
+    /// Baja un tramo, insistiendo: reintento con conexión nueva, enlace renovado y esperas
+    /// cada vez más largas antes de rendirse.
+    private func download(_ index: Int) async throws -> Data {
+        let lower = Int64(index) * Self.chunkBytes
+        let upper = min(lower + Self.chunkBytes, contentLength)
+        let place = megabytes(lower)
+        var lastError: Error = StreamHTTP.Failure.truncated("")
+        for attempt in 0...Self.backoff.count {
+            do {
+                let result = try await StreamHTTP.shared.fetch(makeRequest(from: lower, to: upper),
+                                                               fresh: attempt > 0)
+                guard Int64(result.data.count) >= upper - lower else {
+                    throw StreamHTTP.Failure.truncated(result.transport)
+                }
+                if attempt > 0 {
+                    report("tramo en \(place) recuperado al intento \(attempt + 1) (\(result.transport))", false)
+                }
+                // Copia propia desde cero: los subdatos conservan índices del original.
+                return Data(result.data.prefix(Int(upper - lower)))
+            } catch {
+                lastError = error
+                let reason = (error as? StreamHTTP.Failure)?.text ?? error.localizedDescription
+                guard attempt < Self.backoff.count else { break }
+                // Al segundo y al quinto tropiezo, pedir un enlace nuevo (con token nuevo).
+                let renewing = attempt == 1 || attempt == 4
+                report("corte en \(place): \(reason), "
+                       + (renewing ? "renovando el enlace" : "reintento \(attempt + 1)"), false)
+                if renewing { await renew() }
+                try? await Task.sleep(nanoseconds: UInt64(Self.backoff[attempt] * 1_000_000_000))
+            }
+        }
+        throw lastError
+    }
+
+    /// Renueva el enlace una sola vez aunque varios tramos lo pidan a la vez.
+    private func renew() async {
+        lock.lock()
+        if let renewedAt, Date().timeIntervalSince(renewedAt) < 20 {
+            lock.unlock()
+            return
+        }
+        renewedAt = Date()
+        lock.unlock()
+        guard let fresh = await refresh() else { return }
+        lock.lock()
+        url = fresh.url
+        headers = fresh.headers
+        lock.unlock()
+    }
 }
 
-/// Pedidos HTTP cuyos datos se entregan a medida que llegan.
-final class StreamHTTP: NSObject, URLSessionDataDelegate {
+/// Pedidos HTTP de un tramo, con el protocolo usado para el diagnóstico.
+final class StreamHTTP {
     static let shared = StreamHTTP()
 
     enum Failure: Error {
-        case status(Int)
-        case truncated
+        case status(Int, String)
+        case truncated(String)
+        case network(Int, String, String)
         var text: String {
             switch self {
-            case .status(let code): return "HTTP \(code)"
-            case .truncated: return "conexión cerrada"
+            case .status(let code, let transport): return "HTTP \(code)" + Self.suffix(transport)
+            case .truncated(let transport): return "respuesta incompleta" + Self.suffix(transport)
+            case .network(let code, let message, let transport):
+                return "\(message) [\(code)]" + Self.suffix(transport)
             }
+        }
+        private static func suffix(_ transport: String) -> String {
+            transport.isEmpty ? "" : " (\(transport))"
         }
     }
 
-    struct Connection {
-        let pieces: AsyncThrowingStream<Data, Error>
-        fileprivate let task: URLSessionDataTask
-        func cancel() { task.cancel() }
-        func suspend() { task.suspend() }
-        func resume() { task.resume() }
+    /// Anota con qué protocolo viajó el pedido (h2, h3...).
+    private final class Probe: NSObject, URLSessionTaskDelegate {
+        var transport = ""
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        didFinishCollecting metrics: URLSessionTaskMetrics) {
+            transport = metrics.transactionMetrics.last?.networkProtocolName ?? ""
+        }
     }
 
-    private var session: URLSession!
-    private let lock = NSLock()
-    private var continuations: [Int: AsyncThrowingStream<Data, Error>.Continuation] = [:]
+    private let session: URLSession
 
-    private override init() {
-        super.init()
+    private static func configuration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.httpMaximumConnectionsPerHost = 6
-        config.timeoutIntervalForRequest = 25
+        config.timeoutIntervalForRequest = 12
+        config.timeoutIntervalForResource = 40
         config.urlCache = nil
         config.httpCookieStorage = nil
         config.httpShouldSetCookies = false
-        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        config.waitsForConnectivity = false
+        return config
     }
 
-    func stream(_ request: URLRequest) -> Connection {
-        let task = session.dataTask(with: request)
-        let identifier = task.taskIdentifier
-        let pieces = AsyncThrowingStream<Data, Error> { continuation in
-            self.lock.lock()
-            self.continuations[identifier] = continuation
-            self.lock.unlock()
-            continuation.onTermination = { _ in task.cancel() }
+    private init() {
+        session = URLSession(configuration: Self.configuration())
+    }
+
+    /// `fresh` usa una sesión recién creada: conexión nueva, sin nada heredado de la que falló.
+    func fetch(_ request: URLRequest, fresh: Bool) async throws -> (data: Data, transport: String) {
+        let probe = Probe()
+        let active = fresh ? URLSession(configuration: Self.configuration()) : session
+        defer { if fresh { active.finishTasksAndInvalidate() } }
+        do {
+            let (data, response) = try await active.data(for: request, delegate: probe)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            // 206 = el rango pedido. Un 200 es el archivo entero desde cero: solo sirve si
+            // el tramo pedido también empezaba en cero.
+            let startsAtZero = request.value(forHTTPHeaderField: "Range")?.hasPrefix("bytes=0-") ?? false
+            guard status == 206 || (status == 200 && startsAtZero) else {
+                throw Failure.status(status, probe.transport)
+            }
+            return (data, probe.transport)
+        } catch let failure as Failure {
+            throw failure
+        } catch {
+            let code = (error as NSError).code
+            throw Failure.network(code, error.localizedDescription, probe.transport)
         }
-        task.resume()
-        return Connection(pieces: pieces, task: task)
-    }
-
-    private func take(_ identifier: Int) -> AsyncThrowingStream<Data, Error>.Continuation? {
-        lock.lock()
-        defer { lock.unlock() }
-        return continuations.removeValue(forKey: identifier)
-    }
-
-    private func peek(_ identifier: Int) -> AsyncThrowingStream<Data, Error>.Continuation? {
-        lock.lock()
-        defer { lock.unlock() }
-        return continuations[identifier]
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
-                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        // 206 = el rango pedido. Un 200 significaría el archivo entero desde cero, que no sirve
-        // para un pedido que empieza más adelante.
-        let startsAtZero = dataTask.originalRequest?.value(forHTTPHeaderField: "Range")?.hasPrefix("bytes=0-") ?? false
-        if status == 206 || (status == 200 && startsAtZero) {
-            completionHandler(.allow)
-        } else {
-            take(dataTask.taskIdentifier)?.finish(throwing: Failure.status(status))
-            completionHandler(.cancel)
-        }
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        peek(dataTask.taskIdentifier)?.yield(data)
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let continuation = take(task.taskIdentifier) else { return }
-        if let error { continuation.finish(throwing: error) } else { continuation.finish() }
     }
 }
